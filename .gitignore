@@ -1,0 +1,28 @@
+# Model weights (too large for git — download separately)
+models/**/*.pth
+models/**/*.pt
+
+# Output results
+output/
+combined_results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
