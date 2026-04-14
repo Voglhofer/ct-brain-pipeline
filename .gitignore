@@ -1,7 +1,3 @@
-# Model weights (too large for git — download separately)
-models/**/*.pth
-models/**/*.pt
-
 # Output results
 output/
 combined_results/
