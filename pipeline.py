@@ -109,7 +109,7 @@ def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
     zooms = img.header.get_zooms()
 
     if data.ndim == 4:
-        # Take first volume if 4D (e.g. time series)
+        # Take first volume if 4D (e.g. time series / perfusion)
         data = data[..., 0]
         zooms = zooms[:3]
 
@@ -121,6 +121,9 @@ def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
     slices = [data[:, :, i].T.astype(np.float32) for i in range(n_slices)]
     # .T so rows = Y (anterior→posterior visually flipped to standard radiologic view)
 
+    z_thickness = float(zooms[2]) if len(zooms) >= 3 else None
+    px_spacing = (float(zooms[0]), float(zooms[1])) if len(zooms) >= 2 else None
+
     meta = {
         "PatientID": nii_path.stem.replace(".nii", ""),
         "PatientName": "Unknown",
@@ -131,13 +134,59 @@ def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
         "SeriesDescription": nii_path.name,
         "InstitutionName": "Unknown",
         "Modality": "CT",
-        "SliceThickness": f"{float(zooms[2]):.3f}" if len(zooms) >= 3 else "Unknown",
+        "SliceThickness": f"{z_thickness:.3f}" if z_thickness is not None else "Unknown",
+        "SliceThicknessFloat": z_thickness,
         "Manufacturer": "Unknown",
-        "PixelSpacing": f"{float(zooms[0]):.3f} x {float(zooms[1]):.3f}" if len(zooms) >= 2 else "Unknown",
+        "PixelSpacing": f"{px_spacing[0]:.3f} x {px_spacing[1]:.3f}" if px_spacing is not None else "Unknown",
         "NumSlices": n_slices,
         "SourceFile": str(nii_path),
     }
     return slices, meta
+
+
+# ── Reslicing (thin→thick averaging) ─────────────────────────────────────────────
+
+def reslice_to_thickness(
+    slices: list[np.ndarray],
+    source_thickness: float,
+    target_thickness: float,
+) -> tuple[list[np.ndarray], float, int]:
+    """
+    Average groups of consecutive thin slices into thicker effective slices.
+
+    This mimics how clinical scanners reconstruct thick slices from thin
+    acquisitions, and brings the input closer to the slice thickness our
+    models were trained on (RSNA + AISD: typically 3–10 mm).
+
+    Args:
+        slices:            list of 2D HU arrays (ordered inferior→superior)
+        source_thickness:  acquisition slice thickness (mm)
+        target_thickness:  desired effective thickness (mm)
+
+    Returns:
+        (resliced_slices, achieved_thickness_mm, group_size)
+        If no reslicing is needed (group_size <= 1), returns the input unchanged.
+    """
+    if source_thickness is None or source_thickness <= 0 or target_thickness <= 0:
+        return slices, source_thickness or 0.0, 1
+
+    group = int(round(target_thickness / source_thickness))
+    if group <= 1:
+        return slices, source_thickness, 1
+
+    n = len(slices)
+    if n < group:
+        return slices, source_thickness, 1
+
+    resliced: list[np.ndarray] = []
+    for start in range(0, n - group + 1, group):
+        chunk = slices[start:start + group]
+        # Element-wise mean across slices in the group
+        avg = np.mean(np.stack(chunk, axis=0), axis=0).astype(np.float32)
+        resliced.append(avg)
+
+    achieved = source_thickness * group
+    return resliced, achieved, group
 
 
 # ── Windowing helpers ──────────────────────────────────────────────────────
@@ -559,17 +608,42 @@ def visualize_results(image_hu: np.ndarray, results: dict, title: str, out_path:
 
 # ── DICOM file/folder collection ──────────────────────────────────────────
 
-def collect_input_paths(input_paths: list[str]) -> list[Path]:
-    """Collect all DICOM and NIfTI files from the given paths."""
+# Substrings (case-insensitive) in filenames that should be skipped automatically.
+#   - ROI / mask: segmentation overlays, not raw scans
+#   - TOM:        "tom" (Danish for "empty") series — known to be low-quality
+DEFAULT_SKIP_PATTERNS = ("_roi", "tom")
+
+
+def _should_skip_filename(name: str, patterns: tuple[str, ...]) -> bool:
+    lower = name.lower()
+    return any(pat in lower for pat in patterns)
+
+
+def collect_input_paths(
+    input_paths: list[str],
+    skip_patterns: tuple[str, ...] = DEFAULT_SKIP_PATTERNS,
+) -> list[Path]:
+    """Collect all DICOM and NIfTI files from the given paths.
+
+    Files whose name contains any of `skip_patterns` (case-insensitive) are
+    excluded — by default this drops ROI masks and "TOM" series.
+    """
     files = []
+    skipped = []
     for p in input_paths:
         path = Path(p)
         if path.is_file():
+            if _should_skip_filename(path.name, skip_patterns):
+                skipped.append(path)
+                continue
             files.append(path)
         elif path.is_dir():
             # Recursively find DICOM and NIfTI files
             for f in sorted(path.rglob("*")):
                 if not f.is_file():
+                    continue
+                if _should_skip_filename(f.name, skip_patterns):
+                    skipped.append(f)
                     continue
                 if is_nifti_path(f):
                     files.append(f)
@@ -580,6 +654,13 @@ def collect_input_paths(input_paths: list[str]) -> list[Path]:
                     files.append(f)
         else:
             print(f"  WARNING: {path} does not exist, skipping")
+    if skipped:
+        print(f"  Skipped {len(skipped)} file(s) matching skip patterns "
+              f"({', '.join(skip_patterns)}):")
+        for s in skipped[:5]:
+            print(f"    - {s.name}")
+        if len(skipped) > 5:
+            print(f"    ... and {len(skipped) - 5} more")
     return files
 
 
@@ -901,6 +982,19 @@ def main():
                         help="Skip DICOM series filtering (use all files as-is)")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Batch size for inference (default: 8)")
+    parser.add_argument("--target-thickness", type=float, default=5.0,
+                        help="Target effective slice thickness in mm. Thin source "
+                             "slices are averaged in groups to approximate this. "
+                             "Set to 0 to disable. Default: 5.0 mm.")
+    parser.add_argument("--source-thickness", type=float, default=None,
+                        help="Override source slice thickness (mm) for reslicing. "
+                             "By default this is read from the NIfTI/DICOM header.")
+    parser.add_argument("--no-reslice", action="store_true",
+                        help="Disable thin-to-thick slice averaging.")
+    parser.add_argument("--keep-tom", action="store_true",
+                        help="Do not skip files with 'TOM' in the name.")
+    parser.add_argument("--keep-roi", action="store_true",
+                        help="Do not skip ROI/mask files.")
     args = parser.parse_args()
 
     # Resolve device
@@ -918,7 +1012,13 @@ def main():
     isch_path = Path(args.ischemic_model_path) if args.ischemic_model_path else ISCHEMIC_MODEL_PATH
 
     # Collect input files (DICOM and/or NIfTI)
-    input_files = collect_input_paths(args.input)
+    skip_patterns = tuple(
+        pat for pat, keep in (
+            ("_roi", args.keep_roi),
+            ("tom", args.keep_tom),
+        ) if not keep
+    )
+    input_files = collect_input_paths(args.input, skip_patterns=skip_patterns)
     if not input_files:
         print("ERROR: No DICOM or NIfTI files found in the provided input(s).")
         sys.exit(1)
@@ -1008,6 +1108,56 @@ def main():
         sys.exit(1)
 
     print(f"  Read {len(images_hu)} valid slice(s)")
+
+    # Reslice thin slices into thicker effective slices to match training data
+    if not args.no_reslice and args.target_thickness > 0:
+        source_thk = args.source_thickness
+        if source_thk is None:
+            if use_nifti:
+                source_thk = patient_meta.get("SliceThicknessFloat")
+            else:
+                try:
+                    ds = pydicom.dcmread(str(valid_paths[0]),
+                                         stop_before_pixels=True, force=True)
+                    st = getattr(ds, "SliceThickness", None)
+                    if st is not None:
+                        source_thk = float(st)
+                except Exception:
+                    source_thk = None
+
+        if source_thk is None or source_thk <= 0:
+            print("  Reslicing skipped: source slice thickness unknown "
+                  "(use --source-thickness to override)")
+        else:
+            new_slices, achieved, group = reslice_to_thickness(
+                images_hu, source_thk, args.target_thickness,
+            )
+            if group > 1:
+                print(f"  Reslicing: averaged groups of {group} slice(s) "
+                      f"({source_thk:.2f}mm -> ~{achieved:.2f}mm effective, "
+                      f"target {args.target_thickness:.2f}mm)")
+                print(f"  Slice count: {len(images_hu)} -> {len(new_slices)}")
+                images_hu = new_slices
+                if use_nifti:
+                    src = Path(patient_meta.get("SourceFile", str(valid_paths[0])))
+                    valid_paths = [
+                        src.with_name(f"{src.name}#resliced_{i:04d}")
+                        for i in range(len(new_slices))
+                    ]
+                else:
+                    base = valid_paths[0]
+                    valid_paths = [
+                        base.with_name(f"resliced_{i:04d}{base.suffix}")
+                        for i in range(len(new_slices))
+                    ]
+                patient_meta = dict(patient_meta)
+                patient_meta["SliceThickness"] = (
+                    f"{achieved:.3f} (resliced from {source_thk:.3f})"
+                )
+                patient_meta["NumSlices"] = len(new_slices)
+            else:
+                print(f"  Reslicing not needed (source {source_thk:.2f}mm "
+                      f">= target {args.target_thickness:.2f}mm)")
 
     # ── Run pipeline ───────────────────────────────────────────────────
     print("\nRunning inference...")
