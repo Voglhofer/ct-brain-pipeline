@@ -3,7 +3,8 @@
 Combined CT Brain Scan Pipeline: Hemorrhage + Ischemic Stroke Detection
 ========================================================================
 Hospital-ready pipeline for analysing a full patient CT head scan.
-Takes DICOM files/folders as input, runs two models in parallel:
+Takes DICOM files/folders OR NIfTI (.nii / .nii.gz) volumes as input,
+runs two models in parallel:
   1. Hemorrhage model  — DenseNet121 5-fold ensemble (RSNA-trained)
   2. Ischemic model    — DenseNet121 transfer-learned binary classifier
 
@@ -13,6 +14,9 @@ Usage:
 
   # Single DICOM file
   python pipeline.py /path/to/scan.dcm
+
+  # NIfTI volume (3D CT in HU)
+  python pipeline.py /path/to/scan.nii.gz
 
   # Skip series filtering (use all files as-is)
   python pipeline.py /path/to/folder/ --no-filter
@@ -35,6 +39,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pydicom
+import nibabel as nib
 import torch
 import torch.nn as nn
 import torchvision
@@ -75,6 +80,64 @@ def dicom_to_hu(dcm_path: str) -> np.ndarray:
     slope = float(getattr(ds, "RescaleSlope", 1))
     img = ds.pixel_array.astype(np.float32) * slope + intercept
     return img
+
+
+# ── NIfTI → HU conversion ─────────────────────────────────────────────────
+
+NIFTI_EXTS = (".nii", ".nii.gz")
+
+
+def is_nifti_path(path: Path) -> bool:
+    """Check whether a path points to a NIfTI file."""
+    name = path.name.lower()
+    return name.endswith(".nii") or name.endswith(".nii.gz")
+
+
+def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
+    """
+    Read a NIfTI volume and return:
+      - a list of 2D axial slices in Hounsfield Units (ordered inferior→superior)
+      - a metadata dict (voxel spacing, shape, affine-derived info)
+
+    Assumes the volume is already calibrated in HU (standard for NIfTI CT).
+    Reorients to canonical RAS so the last axis is axial (superior +Z).
+    """
+    img = nib.load(str(nii_path))
+    # Reorient to canonical RAS — last axis becomes superior-inferior (axial slices).
+    img = nib.as_closest_canonical(img)
+    data = img.get_fdata(dtype=np.float32)
+    zooms = img.header.get_zooms()
+
+    if data.ndim == 4:
+        # Take first volume if 4D (e.g. time series)
+        data = data[..., 0]
+        zooms = zooms[:3]
+
+    if data.ndim != 3:
+        raise ValueError(f"Expected 3D NIfTI volume, got shape {data.shape} in {nii_path}")
+
+    # data shape after canonical reorient: (X, Y, Z) with Z = axial
+    n_slices = data.shape[2]
+    slices = [data[:, :, i].T.astype(np.float32) for i in range(n_slices)]
+    # .T so rows = Y (anterior→posterior visually flipped to standard radiologic view)
+
+    meta = {
+        "PatientID": nii_path.stem.replace(".nii", ""),
+        "PatientName": "Unknown",
+        "PatientAge": "Unknown",
+        "PatientSex": "Unknown",
+        "StudyDate": "Unknown",
+        "StudyDescription": "NIfTI volume",
+        "SeriesDescription": nii_path.name,
+        "InstitutionName": "Unknown",
+        "Modality": "CT",
+        "SliceThickness": f"{float(zooms[2]):.3f}" if len(zooms) >= 3 else "Unknown",
+        "Manufacturer": "Unknown",
+        "PixelSpacing": f"{float(zooms[0]):.3f} x {float(zooms[1]):.3f}" if len(zooms) >= 2 else "Unknown",
+        "NumSlices": n_slices,
+        "SourceFile": str(nii_path),
+    }
+    return slices, meta
 
 
 # ── Windowing helpers ──────────────────────────────────────────────────────
@@ -497,16 +560,20 @@ def visualize_results(image_hu: np.ndarray, results: dict, title: str, out_path:
 # ── DICOM file/folder collection ──────────────────────────────────────────
 
 def collect_input_paths(input_paths: list[str]) -> list[Path]:
-    """Collect all DICOM files from the given paths."""
+    """Collect all DICOM and NIfTI files from the given paths."""
     files = []
     for p in input_paths:
         path = Path(p)
         if path.is_file():
             files.append(path)
         elif path.is_dir():
-            # Recursively find DICOM files
+            # Recursively find DICOM and NIfTI files
             for f in sorted(path.rglob("*")):
-                if f.is_file() and (
+                if not f.is_file():
+                    continue
+                if is_nifti_path(f):
+                    files.append(f)
+                elif (
                     f.suffix.lower() in (".dcm", ".dicom")
                     or f.suffix == ""  # DICOM files often have no extension
                 ):
@@ -514,6 +581,13 @@ def collect_input_paths(input_paths: list[str]) -> list[Path]:
         else:
             print(f"  WARNING: {path} does not exist, skipping")
     return files
+
+
+def split_inputs_by_type(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Split a list of input paths into (nifti_files, dicom_files)."""
+    nifti_files = [p for p in paths if is_nifti_path(p)]
+    dicom_files = [p for p in paths if not is_nifti_path(p)]
+    return nifti_files, dicom_files
 
 
 def sort_dicom_by_position(dcm_paths: list[Path]) -> list[Path]:
@@ -812,7 +886,7 @@ def main():
         description="Combined CT Brain Pipeline: Hemorrhage + Ischemic Stroke Detection"
     )
     parser.add_argument("input", nargs="+",
-                        help="DICOM file(s) or folder(s) to analyze")
+                        help="DICOM file(s)/folder(s) or NIfTI (.nii/.nii.gz) volume to analyze")
     parser.add_argument("--visualize", action="store_true",
                         help="Save visualization images")
     parser.add_argument("--device", default="auto",
@@ -843,27 +917,43 @@ def main():
     hem_dir = Path(args.hemorrhage_model_dir) if args.hemorrhage_model_dir else HEMORRHAGE_MODEL_DIR
     isch_path = Path(args.ischemic_model_path) if args.ischemic_model_path else ISCHEMIC_MODEL_PATH
 
-    # Collect input files
+    # Collect input files (DICOM and/or NIfTI)
     input_files = collect_input_paths(args.input)
     if not input_files:
-        print("ERROR: No DICOM files found in the provided input(s).")
+        print("ERROR: No DICOM or NIfTI files found in the provided input(s).")
         sys.exit(1)
 
-    print(f"\nFound {len(input_files)} DICOM file(s)")
+    nifti_files, dicom_files = split_inputs_by_type(input_files)
+    print(f"\nFound {len(dicom_files)} DICOM file(s) and {len(nifti_files)} NIfTI file(s)")
 
-    # ── DICOM series filtering ─────────────────────────────────────────
-    if not args.no_filter and len(input_files) > 1:
-        print("\nFiltering DICOM series...")
-        input_files = filter_dicom_series(input_files)
-        print(f"  {len(input_files)} file(s) after filtering")
+    if nifti_files and dicom_files:
+        print("  WARNING: Mixed DICOM + NIfTI input. Processing NIfTI volume(s) only.")
+        dicom_files = []
 
-    # Sort by z-position if multiple
-    if len(input_files) > 1:
-        input_files = sort_dicom_by_position(input_files)
-        print("  Sorted DICOM files by slice position")
+    use_nifti = len(nifti_files) > 0
 
-    # ── Extract patient metadata ───────────────────────────────────────
-    patient_meta = extract_patient_metadata(input_files)
+    if use_nifti and len(nifti_files) > 1:
+        print(f"  WARNING: Multiple NIfTI files supplied; using only the first: {nifti_files[0].name}")
+        nifti_files = nifti_files[:1]
+
+    if not use_nifti:
+        # ── DICOM series filtering ─────────────────────────────────────
+        if not args.no_filter and len(dicom_files) > 1:
+            print("\nFiltering DICOM series...")
+            dicom_files = filter_dicom_series(dicom_files)
+            print(f"  {len(dicom_files)} file(s) after filtering")
+
+        # Sort by z-position if multiple
+        if len(dicom_files) > 1:
+            dicom_files = sort_dicom_by_position(dicom_files)
+            print("  Sorted DICOM files by slice position")
+
+        # ── Extract patient metadata ───────────────────────────────────
+        patient_meta = extract_patient_metadata(dicom_files)
+    else:
+        # NIfTI: metadata comes from the volume header
+        patient_meta = {}
+
     if patient_meta.get("PatientID", "Unknown") != "Unknown":
         print(f"\n  Patient: {patient_meta['PatientID']}")
 
@@ -884,21 +974,37 @@ def main():
         print("  Expected files: model_epoch_79_0.pth ... model_epoch_79_4.pth")
         sys.exit(1)
 
-    # ── Read all DICOM files ───────────────────────────────────────────
-    print("\nReading DICOM files...")
-    images_hu = []
-    valid_paths = []
+    # ── Read input volume(s) → list of HU slices ──────────────────────
+    images_hu: list[np.ndarray] = []
+    valid_paths: list[Path] = []
 
-    for dcm_path in input_files:
+    if use_nifti:
+        nii_path = nifti_files[0]
+        print(f"\nReading NIfTI volume: {nii_path.name}")
         try:
-            hu = dicom_to_hu(str(dcm_path))
-            images_hu.append(hu)
-            valid_paths.append(dcm_path)
+            slices, nii_meta = nifti_to_hu_slices(nii_path)
         except Exception as e:
-            print(f"  WARNING: Could not read {dcm_path.name}: {e}")
+            print(f"ERROR: Could not read NIfTI file {nii_path}: {e}")
+            sys.exit(1)
+        images_hu = slices
+        # Synthesize one virtual "path" per slice for downstream reporting
+        valid_paths = [nii_path.with_name(f"{nii_path.name}#slice_{i:04d}") for i in range(len(slices))]
+        patient_meta = nii_meta
+        print(f"  Loaded {len(slices)} axial slice(s) "
+              f"(thickness={nii_meta.get('SliceThickness', 'Unknown')} mm, "
+              f"pixel_spacing={nii_meta.get('PixelSpacing', 'Unknown')} mm)")
+    else:
+        print("\nReading DICOM files...")
+        for dcm_path in dicom_files:
+            try:
+                hu = dicom_to_hu(str(dcm_path))
+                images_hu.append(hu)
+                valid_paths.append(dcm_path)
+            except Exception as e:
+                print(f"  WARNING: Could not read {dcm_path.name}: {e}")
 
     if not images_hu:
-        print("ERROR: No valid DICOM files could be read.")
+        print("ERROR: No valid input slices could be read.")
         sys.exit(1)
 
     print(f"  Read {len(images_hu)} valid slice(s)")

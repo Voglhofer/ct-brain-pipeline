@@ -1,6 +1,7 @@
 torch>=2.0
 torchvision>=0.15
 pydicom>=2.4
+nibabel>=5.0
 opencv-python>=4.8
 numpy>=1.24
 albumentations>=1.3

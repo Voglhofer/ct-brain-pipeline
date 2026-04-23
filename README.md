@@ -2,6 +2,7 @@
 
 Hospital-ready pipeline that analyses a full patient non-contrast CT head scan
 for **intracranial hemorrhage** (6 subtypes) and **ischemic stroke** in parallel.
+Accepts both **DICOM** (file/folder) and **NIfTI** (`.nii` / `.nii.gz`) input.
 
 ## Models
 
@@ -32,6 +33,9 @@ python pipeline.py /path/to/patient_dicom_folder/
 
 # Single DICOM file
 python pipeline.py /path/to/scan.dcm
+
+# NIfTI volume (3D CT in HU)
+python pipeline.py /path/to/scan.nii.gz
 
 # With visualization + custom output dir
 python pipeline.py /path/to/patient_dicom_folder/ --visualize --output-dir results/
