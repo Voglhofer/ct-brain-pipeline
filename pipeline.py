@@ -868,7 +868,8 @@ def aggregate_patient_results(all_results: list[dict]) -> dict:
 # ── Print summary ──────────────────────────────────────────────────────────
 
 def print_summary(all_results: list[dict], patient_meta: dict | None = None,
-                  patient_agg: dict | None = None):
+                  patient_agg: dict | None = None,
+                  show_slices: bool = False):
     """Print a formatted patient-level summary."""
     print("\n" + "=" * 70)
     print("  COMBINED PIPELINE — PATIENT REPORT")
@@ -900,62 +901,46 @@ def print_summary(all_results: list[dict], patient_meta: dict | None = None,
     if patient_agg:
         hem = patient_agg["hemorrhage"]
         isch = patient_agg["ischemic"]
+        hem_prob = hem["subtypes"]["any"]["max_probability"]
+        hem_thresh = HEMORRHAGE_THRESHOLDS["any"]
+        isch_prob = isch["max_probability"]
+        isch_thresh = 0.5
 
-        print(f"\n{'─' * 70}")
-        print("  PATIENT-LEVEL DIAGNOSIS")
-        print(f"{'─' * 70}")
+        print(f"\n{'=' * 70}")
+        print("  FINAL PATIENT PROBABILITY")
+        print(f"{'=' * 70}")
+
+        hem_flag = "POSITIVE" if hem["patient_positive"] else "negative"
+        isch_flag = "POSITIVE" if isch["patient_positive"] else "negative"
+
+        print(f"\n  HEMORRHAGE       : {hem_prob*100:6.2f}%   "
+              f"(threshold {hem_thresh*100:.2f}%)   {hem_flag}")
+        print(f"  ISCHEMIC STROKE  : {isch_prob*100:6.2f}%   "
+              f"(threshold {isch_thresh*100:.2f}%)   {isch_flag}")
 
         if hem["patient_positive"]:
-            print(f"\n  ⚠ HEMORRHAGE DETECTED  ({hem['n_positive_slices']}/{n_total} slices)")
+            print("\n  Hemorrhage subtype breakdown (max probability across slices):")
             for label in HEMORRHAGE_LABELS[1:]:
                 sub = hem["subtypes"][label]
-                if sub["patient_positive"]:
-                    print(f"    → {label}: max p={sub['max_probability']:.3f} "
-                          f"({sub['n_positive_slices']} slice(s))")
-        else:
-            any_max = hem["subtypes"]["any"]["max_probability"]
-            print(f"\n  ✓ No hemorrhage detected  (max p={any_max:.3f})")
+                marker = "*" if sub["patient_positive"] else " "
+                print(f"    {marker} {label:18s} {sub['max_probability']*100:6.2f}%   "
+                      f"(threshold {HEMORRHAGE_THRESHOLDS[label]*100:.2f}%)")
 
-        if isch["patient_positive"]:
-            print(f"\n  ⚠ ISCHEMIC STROKE DETECTED  "
-                  f"({isch['n_positive_slices']}/{n_total} slices, "
-                  f"max p={isch['max_probability']:.3f})")
-        else:
-            print(f"\n  ✓ No ischemic stroke detected  (max p={isch['max_probability']:.3f})")
+        print(f"\n{'=' * 70}")
 
-    if n_total <= 10:
-        print(f"\n{'─' * 70}")
-        print("  PER-SLICE DETAILS")
-        print(f"{'─' * 70}")
+    if show_slices and n_total > 0:
+        print(f"\n{'-' * 70}")
+        print(f"  PER-SLICE DETAILS ({n_total} slices)")
+        print(f"{'-' * 70}")
         for res in all_results:
             hem = res["results"]["hemorrhage"]
             isch = res["results"]["ischemic"]["ischemic_stroke"]
             any_hem = hem["any"]
-            h_status = "⚠ HEM" if any_hem["positive"] else "  neg"
-            i_status = "⚠ ISC" if isch["positive"] else "  neg"
+            h_status = "HEM+" if any_hem["positive"] else "neg "
+            i_status = "ISC+" if isch["positive"] else "neg "
             print(f"  Slice {res['slice_index']:3d}: "
                   f"{h_status} (p={any_hem['probability']:.3f})  "
-                  f"{i_status} (p={isch['probability']:.3f})  "
-                  f"[{res['file']}]")
-    else:
-        pos_slices = [r for r in all_results
-                      if r["results"]["hemorrhage"]["any"]["positive"]
-                      or r["results"]["ischemic"]["ischemic_stroke"]["positive"]]
-        if pos_slices:
-            print(f"\n{'─' * 70}")
-            print(f"  POSITIVE SLICES ({len(pos_slices)}/{n_total})")
-            print(f"{'─' * 70}")
-            for res in pos_slices:
-                hem = res["results"]["hemorrhage"]
-                isch = res["results"]["ischemic"]["ischemic_stroke"]
-                any_hem = hem["any"]
-                flags = []
-                if any_hem["positive"]:
-                    subtypes = [l for l in HEMORRHAGE_LABELS[1:] if hem[l]["positive"]]
-                    flags.append(f"HEM p={any_hem['probability']:.3f} [{','.join(subtypes)}]")
-                if isch["positive"]:
-                    flags.append(f"ISC p={isch['probability']:.3f}")
-                print(f"  Slice {res['slice_index']:3d}: {' | '.join(flags)}")
+                  f"{i_status} (p={isch['probability']:.3f})")
 
     print(f"\n{'=' * 70}\n")
 
@@ -995,6 +980,8 @@ def main():
                         help="Do not skip files with 'TOM' in the name.")
     parser.add_argument("--keep-roi", action="store_true",
                         help="Do not skip ROI/mask files.")
+    parser.add_argument("--show-slices", action="store_true",
+                        help="Show per-slice details in console output.")
     args = parser.parse_args()
 
     # Resolve device
@@ -1213,7 +1200,8 @@ def main():
     patient_agg = aggregate_patient_results(all_results)
 
     # ── Print and save results ─────────────────────────────────────────
-    print_summary(all_results, patient_meta=patient_meta, patient_agg=patient_agg)
+    print_summary(all_results, patient_meta=patient_meta,
+                  patient_agg=patient_agg, show_slices=args.show_slices)
 
     results_path = out_dir / "results.json"
     with open(results_path, "w") as f:
