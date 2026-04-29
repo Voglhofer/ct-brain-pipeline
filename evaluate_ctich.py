@@ -12,18 +12,24 @@ Layout expected:
 
 The dataset stores already brain-windowed JPG slices (NO HU values).
 Preprocessing mirrors the Bachelor_RSNA_test SeuTao pipeline
-(`run_ctich_full_ensemble.py`): the JPG is read directly as uint8
-grayscale (skipping the lossy HU round-trip) and stacked with its
-previous and next neighbour slices to form the 3-channel input that the
-hemorrhage DenseNet expects. ImageNet-style normalisation is then applied
-by `pipeline.to_tensor`. This matches the training-time preprocessing of
-the RSNA 2019 hemorrhage models.
+(`run_ctich_full_ensemble.py`):
 
-The ischemic-stroke model is intentionally skipped on CT-ICH:
-  1. It needs three different HU windows (brain/stroke/soft) which cannot
-     be reconstructed from a pre-windowed brain JPG.
-  2. CT-ICH has no ground truth for ischemic stroke.
-Its columns in the output CSV are written as empty strings.
+  * **Hemorrhage** — the JPG is read directly as uint8 grayscale and
+    stacked with its previous and next neighbour slices to form the
+    3-channel input that the hemorrhage DenseNet expects. ImageNet-style
+    normalisation is then applied by `pipeline.to_tensor`. This matches
+    the training-time preprocessing of the RSNA 2019 hemorrhage models.
+    The full 3-backbone × 5-fold ensemble (15 models) is used when the
+    `models/hemorrhage/{DenseNet121,DenseNet169,SE-ResNeXt101}/`
+    subdirectories are present.
+
+  * **Ischemic** — the JPG is converted back to pseudo-HU by inverting
+    the brain window (linear map uint8 [0,255] -> HU [0,80]). Inside
+    that range the round-trip is exact, so the brain-window and
+    stroke-window (32/8) channels are reconstructed losslessly; only
+    the soft-tissue window (40/120) is clipped at HU=80 and is
+    therefore an approximation. CT-ICH has no ischemic ground truth,
+    so these predictions are reported but not scored.
 
 Patient-level aggregation: max-pool across all slices (same strategy as
 evaluate_cq500.py), so the patient is positive if ANY slice fires.
@@ -55,7 +61,14 @@ from pipeline import (
     load_hemorrhage_models,
     load_ischemic_model,
     predict_hemorrhage_batch,
+    predict_ischemic_batch,
+    prepare_ischemic_input,
 )
+
+# Brain-window parameters of the dataset (standard 40/80 brain window).
+# Used to invert the JPG -> pseudo-HU for the ischemic preprocessing.
+BRAIN_WINDOW_CENTER = 40.0
+BRAIN_WINDOW_WIDTH = 80.0
 
 # CT-ICH labels: subtype columns in hemorrhage_diagnosis.csv
 SUBTYPE_COLS = {
@@ -95,6 +108,18 @@ def make_3ch_neighbours(slices_uint8: list[np.ndarray], idx: int) -> np.ndarray:
         [slices_uint8[prev_idx], slices_uint8[idx], slices_uint8[next_idx]],
         axis=-1,
     )
+
+
+def uint8_to_pseudo_hu(img_uint8: np.ndarray) -> np.ndarray:
+    """Invert the brain window to recover pseudo-HU in [0, 80].
+
+    Used only for the ischemic model, which needs HU values to apply its
+    multi-window preprocessing. The map is exact within the brain HU
+    range; values outside [0, 80] are not recoverable from the JPG.
+    """
+    low = BRAIN_WINDOW_CENTER - BRAIN_WINDOW_WIDTH / 2   # 0 HU
+    high = BRAIN_WINDOW_CENTER + BRAIN_WINDOW_WIDTH / 2  # 80 HU
+    return img_uint8.astype(np.float32) / 255.0 * (high - low) + low
 
 
 # ── GT loading ─────────────────────────────────────────────────────────────
@@ -151,15 +176,16 @@ def list_patient_slices(patient_dir: Path) -> list[tuple[int, Path]]:
 def run_one_patient(
     patient_dir: Path,
     hem_models: list,
-    isch_model: torch.nn.Module,  # accepted for API parity, not used on CT-ICH
+    isch_model: torch.nn.Module,
     device: torch.device,
     batch_size: int,
 ) -> dict | None:
-    """Run the hemorrhage ensemble on every slice and return aggregate dict.
+    """Run hemorrhage + ischemic ensembles on every slice and aggregate.
 
-    Uses the SeuTao-faithful preprocessing from Bachelor_RSNA_test:
-    direct uint8 read + prev/curr/next neighbour-slice 3-channel stacking.
-    The ischemic model is skipped (see module docstring).
+    Hemorrhage uses the SeuTao-faithful direct-uint8 + prev/curr/next
+    neighbour stacking. Ischemic uses pseudo-HU inversion to recover
+    HU values within the brain window range and then runs the standard
+    multi-window preprocessing from `pipeline.prepare_ischemic_input`.
     """
     slices = list_patient_slices(patient_dir)
     if not slices:
@@ -180,19 +206,14 @@ def run_one_patient(
     hem_inputs = [make_3ch_neighbours(slices_uint8, i) for i in range(len(slices_uint8))]
     hem_results = predict_hemorrhage_batch(hem_models, hem_inputs, device, batch_size)
 
-    # Stub ischemic results so aggregate_patient_results stays happy.
-    isch_stub = {
-        "ischemic_stroke": {
-            "probability": 0.0,
-            "threshold": 0.5,
-            "positive": False,
-        }
-    }
+    isch_inputs = [prepare_ischemic_input(uint8_to_pseudo_hu(s)) for s in slices_uint8]
+    isch_results = predict_ischemic_batch(isch_model, isch_inputs, device, batch_size)
+
     all_results = []
-    for idx, hem in zip(slice_indices, hem_results):
+    for idx, hem, isch in zip(slice_indices, hem_results, isch_results):
         all_results.append({
             "slice_index": idx,
-            "results": {"hemorrhage": hem, "ischemic": isch_stub},
+            "results": {"hemorrhage": hem, "ischemic": isch},
         })
 
     agg = aggregate_patient_results(all_results)
@@ -245,6 +266,7 @@ def evaluate(
                 continue
 
             hem = agg["hemorrhage"]
+            isch = agg["ischemic"]
             gt = labels.get(pid)
 
             row = {
@@ -253,9 +275,10 @@ def evaluate(
                 "gt_any": (gt or {}).get("any", ""),
                 "pred_any": int(hem["patient_positive"]),
                 "p_any": hem["subtypes"]["any"]["max_probability"],
-                # Ischemic skipped on CT-ICH — see module docstring.
-                "pred_ischemic": "",
-                "p_ischemic": "",
+                # Ischemic predictions are reported but unscored
+                # (CT-ICH has no ischemic ground truth).
+                "pred_ischemic": int(isch["patient_positive"]),
+                "p_ischemic": isch["max_probability"],
                 "in_gt_csv": int(gt is not None),
             }
             for l in HEMORRHAGE_LABELS:

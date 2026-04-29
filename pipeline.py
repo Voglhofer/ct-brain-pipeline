@@ -5,7 +5,11 @@ Combined CT Brain Scan Pipeline: Hemorrhage + Ischemic Stroke Detection
 Hospital-ready pipeline for analysing a full patient CT head scan.
 Takes DICOM files/folders OR NIfTI (.nii / .nii.gz) volumes as input,
 runs two models in parallel:
-  1. Hemorrhage model  — DenseNet121 5-fold ensemble (RSNA-trained)
+  1. Hemorrhage model  — 3-backbone × 5-fold ensemble (15 models total:
+                          DenseNet121 + DenseNet169 + SE-ResNeXt101),
+                          all RSNA-trained. Falls back to a flat
+                          DenseNet121-only layout if the per-backbone
+                          subdirectories are missing.
   2. Ischemic model    — DenseNet121 transfer-learned binary classifier
 
 Usage:
@@ -249,7 +253,7 @@ def prepare_ischemic_input(image_hu: np.ndarray) -> np.ndarray:
 # ── Model definitions ─────────────────────────────────────────────────────
 
 class DenseNet121_Hemorrhage(nn.Module):
-    """RSNA hemorrhage detection model (6-class)."""
+    """RSNA hemorrhage detection model (6-class) — DenseNet121 backbone."""
     def __init__(self):
         super().__init__()
         self.densenet121 = torchvision.models.densenet121(weights=None).features
@@ -264,6 +268,57 @@ class DenseNet121_Hemorrhage(nn.Module):
         x = x.view(-1, 1024)
         x = self.mlp(x)
         return x
+
+
+class DenseNet169_Hemorrhage(nn.Module):
+    """RSNA hemorrhage detection model (6-class) — DenseNet169 backbone.
+
+    Mirrors SeuTao 2DNet `DenseNet169_change_avg`.
+    """
+    def __init__(self):
+        super().__init__()
+        self.densenet169 = torchvision.models.densenet169(weights=None).features
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.relu = nn.ReLU()
+        self.mlp = nn.Linear(1664, 6)
+
+    def forward(self, x):
+        x = self.densenet169(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.mlp(x)
+        return x
+
+
+class SeResNext101_Hemorrhage(nn.Module):
+    """RSNA hemorrhage detection model (6-class) — SE-ResNeXt101 backbone.
+
+    Mirrors SeuTao 2DNet `SeResNext101_change_avg`. Requires the
+    `pretrainedmodels` package (declared in requirements.txt). The
+    ImageNet weights are *not* downloaded; the checkpoint overwrites
+    everything anyway.
+    """
+    def __init__(self):
+        super().__init__()
+        import pretrainedmodels  # local import — optional dep at runtime
+        self.model_ft = pretrainedmodels.__dict__["se_resnext101_32x4d"](
+            num_classes=1000, pretrained=None
+        )
+        num_ftrs = self.model_ft.last_linear.in_features
+        self.model_ft.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.model_ft.last_linear = nn.Sequential(nn.Linear(num_ftrs, 6, bias=True))
+
+    def forward(self, x):
+        return self.model_ft(x)
+
+
+# Backbone registry: directory name (under models/hemorrhage/) -> class
+HEMORRHAGE_BACKBONES = {
+    "DenseNet121":   DenseNet121_Hemorrhage,
+    "DenseNet169":   DenseNet169_Hemorrhage,
+    "SE-ResNeXt101": SeResNext101_Hemorrhage,
+}
 
 
 class DenseNet121_Ischemic(nn.Module):
@@ -306,8 +361,42 @@ def to_tensor(img_uint8: np.ndarray) -> torch.Tensor:
 # ── Model loading ──────────────────────────────────────────────────────────
 
 def load_hemorrhage_models(model_dir: Path, device: torch.device) -> list:
-    """Load all 5 folds of the DenseNet121 hemorrhage ensemble."""
-    models = []
+    """Load the hemorrhage ensemble.
+
+    If per-backbone subdirectories exist (`DenseNet121/`, `DenseNet169/`,
+    `SE-ResNeXt101/`) we load all 5 folds from each one, giving a 15-model
+    3-backbone ensemble that matches Bachelor_RSNA_test/run_ctich_full_ensemble.py.
+    Otherwise we fall back to the legacy flat layout (5 DenseNet121 folds
+    directly under model_dir) for backwards compatibility.
+    """
+    models: list = []
+    subdir_layout = any((model_dir / name).is_dir() for name in HEMORRHAGE_BACKBONES)
+
+    if subdir_layout:
+        for name, cls in HEMORRHAGE_BACKBONES.items():
+            arch_dir = model_dir / name
+            if not arch_dir.is_dir():
+                print(f"  WARNING: {arch_dir} not found, skipping backbone {name}")
+                continue
+            n_loaded = 0
+            for fold in range(5):
+                ckpt_path = arch_dir / f"model_epoch_79_{fold}.pth"
+                if not ckpt_path.exists():
+                    print(f"  WARNING: {ckpt_path} not found, skipping {name} fold {fold}")
+                    continue
+                model = cls()
+                model = nn.DataParallel(model)
+                ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+                model.load_state_dict(ckpt["state_dict"])
+                model.to(device)
+                model.eval()
+                models.append(model)
+                n_loaded += 1
+            print(f"  Loaded {n_loaded} {name} folds")
+        print(f"  Hemorrhage ensemble: {len(models)} models across {sum(1 for n in HEMORRHAGE_BACKBONES if (model_dir / n).is_dir())} backbones")
+        return models
+
+    # Legacy flat DenseNet121-only layout
     for fold in range(5):
         ckpt_path = model_dir / f"model_epoch_79_{fold}.pth"
         if not ckpt_path.exists():
@@ -320,7 +409,7 @@ def load_hemorrhage_models(model_dir: Path, device: torch.device) -> list:
         model.to(device)
         model.eval()
         models.append(model)
-    print(f"  Loaded {len(models)} hemorrhage model folds")
+    print(f"  Loaded {len(models)} hemorrhage model folds (legacy DenseNet121-only layout)")
     return models
 
 
