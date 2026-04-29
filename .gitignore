@@ -2,6 +2,7 @@
 output/
 output_all/
 output_kaggle/
+output_cq500/
 combined_results/
 
 # Datasets (kagglehub cache + local data)
@@ -10,6 +11,7 @@ kagglehub/
 data/
 datasets/
 Brain_Stroke_CT_Dataset/
+CQ500/
 *.zip
 
 # Python

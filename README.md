@@ -126,6 +126,37 @@ across the 3 input channels (no multi-window for the ischemic model). Treat
 the numbers as a practical baseline rather than a fully apples-to-apples
 evaluation.
 
+## Evaluating on CQ500 (patient-level, max-pool)
+
+[evaluate_cq500.py](evaluate_cq500.py) iterates patient folders under a
+local CQ500 root, runs the full pipeline per patient (DICOM series filtering
++ z-sort + batched inference), aggregates slice probabilities to a
+patient-level diagnosis via **max pooling** (handled by
+`pipeline.aggregate_patient_results`), and compares against majority vote
+(≥2 of 3 readers) of `R1/R2/R3` reads in CQ500's `reads.csv`.
+
+```bash
+python evaluate_cq500.py \
+    --dataset-path /path/to/CQ500 \
+    --reads-csv   /path/to/reads.csv \
+    --device mps                # auto-detected (cuda/mps/cpu)
+
+# Smoke test
+python evaluate_cq500.py --dataset-path ... --reads-csv ... --limit 5
+
+# Idempotent rerun (skip patients already in patient_predictions.csv)
+python evaluate_cq500.py ... --resume
+```
+
+Outputs in `output_cq500/`:
+- `patient_predictions.csv` — one row per patient with GT, predictions and
+  per-subtype max-pooled probabilities.
+- `summary.json` — accuracy / precision / recall / specificity / F1 per
+  hemorrhage subtype (any, IPH, IVH, SAH, EDH, SDH).
+
+CQ500 has no ischemic stroke labels, so ischemic predictions are written to
+the CSV for inspection but excluded from metrics.
+
 ## Hemorrhage Thresholds (Youden-Optimal)
 
 | Subtype | Threshold |
