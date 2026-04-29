@@ -49,6 +49,8 @@ from pipeline import (
     load_ischemic_model,
     predict_hemorrhage_batch,
     predict_ischemic_batch,
+    prepare_hemorrhage_input,
+    prepare_ischemic_input,
 )
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -60,20 +62,37 @@ GT_CLASSES = {
     "Normal":    {"hemorrhage": False, "ischemic": False},
 }
 
+# The Kaggle PNGs are pre-windowed with the standard brain window.
+# Inverting that window recovers pseudo-HU values in the [0, 80] HU range,
+# which lets us run the pipeline's real preprocessing (multi-window for the
+# ischemic model in particular). HU outside [0, 80] is clipped, but the
+# stroke window (center=32, width=8 → HU [28, 36]) and brain window
+# (center=40, width=80 → HU [0, 80]) both live inside that range, so most
+# diagnostically useful contrast is preserved.
+BRAIN_WINDOW_CENTER = 40.0
+BRAIN_WINDOW_WIDTH = 80.0
+
 
 # ── Image loading & preprocessing ──────────────────────────────────────────
 
-def load_image_as_3ch(path: Path, size: int) -> np.ndarray:
+def load_image_as_pseudo_hu(path: Path) -> np.ndarray:
     """
-    Load a pre-windowed CT slice PNG/JPG and return a (size, size, 3) uint8.
-    The grayscale value is replicated across all 3 channels because the
-    original HU values are not available in this dataset.
+    Load a Kaggle PNG and invert the brain window to pseudo-HU.
+
+    NOTE: the dataset's Bleeding / Ischemia images are stored as RGBA with
+    very small differences between R/G/B (presumably multi-window encoded),
+    while Normal images are pure grayscale. Using channel differences would
+    be a label leak, so we collapse to luminance via cv2.IMREAD_GRAYSCALE.
     """
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"Could not read image: {path}")
-    img = cv2.resize(img, (size, size))
-    return np.stack([img, img, img], axis=-1)
+    if img.shape != (512, 512):
+        img = cv2.resize(img, (512, 512))
+
+    low = BRAIN_WINDOW_CENTER - BRAIN_WINDOW_WIDTH / 2  # 0 HU
+    high = BRAIN_WINDOW_CENTER + BRAIN_WINDOW_WIDTH / 2  # 80 HU
+    return img.astype(np.float32) / 255.0 * (high - low) + low
 
 
 def collect_images(root: Path, classes: list[str], limit: int | None) -> list[tuple[Path, str]]:
@@ -151,8 +170,11 @@ def evaluate(
             hem_inputs, isch_inputs, valid = [], [], []
             for path, cls in batch:
                 try:
-                    hem_inputs.append(load_image_as_3ch(path, 512))
-                    isch_inputs.append(load_image_as_3ch(path, 256))
+                    hu = load_image_as_pseudo_hu(path)
+                    # Use the pipeline's real preprocessing — brain window for
+                    # hemorrhage, multi-window (brain/stroke/soft) for ischemic.
+                    hem_inputs.append(prepare_hemorrhage_input(hu))
+                    isch_inputs.append(prepare_ischemic_input(hu))
                     valid.append((path, cls))
                 except Exception as e:
                     print(f"  SKIP {path.name}: {e}")
