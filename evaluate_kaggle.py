@@ -275,6 +275,52 @@ def print_report(stats: dict) -> None:
     print()
 
 
+def print_auc_report(csv_path: Path) -> None:
+    """Slice-level AUC for hemorrhage and ischemic discrimination."""
+    # Local import to avoid coupling with evaluate_ctich
+    from evaluate_ctich import roc_auc, bootstrap_auc_ci
+    import csv as _csv
+
+    rows = list(_csv.DictReader(open(csv_path)))
+    if not rows:
+        return
+
+    # Hemorrhage: positives = Bleeding, negatives = Normal (exclude Ischemia
+    # — the model isn't trained to distinguish ischemia from hemorrhage).
+    hem_rows = [r for r in rows if r["class"] in ("Bleeding", "Normal")]
+    if hem_rows:
+        y = np.array([int(r["gt_hemorrhage"]) for r in hem_rows])
+        p = np.array([float(r["p_any"]) for r in hem_rows])
+        auc = roc_auc(y, p)
+        lo, hi = bootstrap_auc_ci(y, p)
+        print(f"  Hemorrhage (Bleeding vs Normal, n={len(hem_rows)})  "
+              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
+        # Per-subtype (all positives are "Bleeding" → only "any" is meaningful;
+        # subtype ground-truth is unavailable in this dataset)
+
+    # Ischemic: positives = Ischemia, negatives = Normal
+    isch_rows = [r for r in rows if r["class"] in ("Ischemia", "Normal")]
+    if isch_rows:
+        y = np.array([int(r["gt_ischemic"]) for r in isch_rows])
+        p = np.array([float(r["p_ischemic"]) for r in isch_rows])
+        auc = roc_auc(y, p)
+        lo, hi = bootstrap_auc_ci(y, p)
+        print(f"  Ischemic   (Ischemia vs Normal, n={len(isch_rows)})  "
+              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
+
+    # Three-way: any-stroke (Bleeding OR Ischemia) vs Normal, using
+    # max(p_any, p_ischemic) as the combined stroke score.
+    all_rows = [r for r in rows if r["class"] in ("Bleeding", "Ischemia", "Normal")]
+    if all_rows:
+        y = np.array([1 if r["class"] in ("Bleeding", "Ischemia") else 0 for r in all_rows])
+        p = np.array([max(float(r["p_any"]), float(r["p_ischemic"])) for r in all_rows])
+        auc = roc_auc(y, p)
+        lo, hi = bootstrap_auc_ci(y, p)
+        print(f"  Any stroke (Bleeding+Ischemia vs Normal, n={len(all_rows)})  "
+              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
+    print()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -339,6 +385,10 @@ def main() -> int:
 
     # 5. Report
     print_report(stats)
+    print("\n" + "=" * 72)
+    print("  AUC (slice-level discrimination)")
+    print("=" * 72)
+    print_auc_report(csv_path)
     print(f"Per-image predictions: {csv_path}")
     return 0
 
