@@ -257,8 +257,12 @@ def print_report(stats: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
-                        choices=["cpu", "cuda"], help="Inference device")
+    default_device = (
+        "cuda" if torch.cuda.is_available()
+        else ("mps" if torch.backends.mps.is_available() else "cpu")
+    )
+    parser.add_argument("--device", default=default_device,
+                        choices=["cpu", "cuda", "mps"], help="Inference device")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for inference")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit images per class (smoke test)")
