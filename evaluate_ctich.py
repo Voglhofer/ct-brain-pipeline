@@ -318,6 +318,55 @@ def metrics(tp: int, fp: int, tn: int, fn: int) -> tuple[float, float, float, fl
     return acc, prec, rec, spec, f1
 
 
+def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Mann-Whitney-U based AUC. Returns NaN if only one class present."""
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    pos = y_score[y_true == 1]
+    neg = y_score[y_true == 0]
+    if pos.size == 0 or neg.size == 0:
+        return float("nan")
+    # Rank-sum AUC with tie correction.
+    order = np.argsort(y_score, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(y_score) + 1)
+    # Average ties
+    sorted_scores = y_score[order]
+    i = 0
+    while i < len(sorted_scores):
+        j = i
+        while j + 1 < len(sorted_scores) and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        if j > i:
+            avg_rank = (ranks[order[i]] + ranks[order[j]]) / 2.0
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg_rank
+        i = j + 1
+    n_pos = pos.size
+    n_neg = neg.size
+    rank_sum_pos = ranks[y_true == 1].sum()
+    return float((rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def bootstrap_auc_ci(
+    y_true: np.ndarray, y_score: np.ndarray, n_boot: int = 1000, seed: int = 42
+) -> tuple[float, float]:
+    """Patient-level percentile bootstrap 95% CI for AUC."""
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    aucs = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        a = roc_auc(y_true[idx], y_score[idx])
+        if not np.isnan(a):
+            aucs.append(a)
+    if not aucs:
+        return float("nan"), float("nan")
+    return float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))
+
+
 def print_report(rows: list[dict]) -> None:
     print("\n" + "=" * 72)
     print("  PATIENT-LEVEL RESULTS — CT-ICH")
@@ -338,7 +387,12 @@ def print_report(rows: list[dict]) -> None:
         elif not gt and pr:  fp += 1
         else:                tn += 1
     acc, prec, rec, spec, f1 = metrics(tp, fp, tn, fn)
+    y_true_any = np.array([int(r["gt_any"]) for r in eval_rows])
+    y_score_any = np.array([float(r["p_any"]) for r in eval_rows])
+    auc_any = roc_auc(y_true_any, y_score_any)
+    ci_lo, ci_hi = bootstrap_auc_ci(y_true_any, y_score_any)
     print(f"\n  HEMORRHAGE (any)   n={n}")
+    print(f"    AUC={auc_any:.4f}  [95% CI {ci_lo:.4f}, {ci_hi:.4f}]")
     print(f"    TP={tp}  FP={fp}  TN={tn}  FN={fn}")
     print(f"    acc={acc*100:.2f}%  prec={prec*100:.2f}%  "
           f"recall={rec*100:.2f}%  spec={spec*100:.2f}%  F1={f1*100:.2f}%")
@@ -357,7 +411,11 @@ def print_report(rows: list[dict]) -> None:
             elif not gt and pr:  fp += 1
             else:                tn += 1
         acc, prec, rec, spec, f1 = metrics(tp, fp, tn, fn)
-        print(f"    {l:18s} acc={acc*100:6.2f}%  "
+        y_true = np.array([int(r.get(f"gt_{l}") or 0) for r in eval_rows])
+        y_score = np.array([float(r.get(f"p_{l}") or 0.0) for r in eval_rows])
+        auc = roc_auc(y_true, y_score)
+        auc_str = f"AUC={auc:.4f}" if not np.isnan(auc) else "AUC=  n/a "
+        print(f"    {l:18s} {auc_str}  "
               f"recall={rec*100:6.2f}%  spec={spec*100:6.2f}%  F1={f1*100:6.2f}%  "
               f"(TP={tp} FP={fp} TN={tn} FN={fn})")
 
