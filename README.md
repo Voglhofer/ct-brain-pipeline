@@ -98,6 +98,34 @@ Contains patient metadata, patient-level diagnosis, and per-slice probabilities.
 ### Visualizations
 Per-slice PNG with CT scan (brain window), hemorrhage bar chart with per-class thresholds, and ischemic gauge.
 
+## Evaluating on the Kaggle Brain Stroke CT Dataset
+
+The script [evaluate_kaggle.py](evaluate_kaggle.py) downloads
+`ozguraslank/brain-stroke-ct-dataset` via `kagglehub`, runs both models on
+each PNG slice, and reports per-class accuracy + a confusion matrix.
+
+```bash
+pip install -r requirements.txt   # includes kagglehub
+
+# Make sure Kaggle credentials are configured (~/.kaggle/kaggle.json or env vars)
+python evaluate_kaggle.py --device cuda --batch-size 16
+
+# Quick smoke test (50 imgs/class)
+python evaluate_kaggle.py --limit 50
+
+# If already downloaded
+python evaluate_kaggle.py --dataset-path /path/to/Brain_Stroke_CT_Dataset
+```
+
+Output: `output_kaggle/predictions.csv` + console report. The dataset cache,
+and any `output_kaggle/` results, are git-ignored.
+
+**Caveat:** the dataset stores pre-windowed 2D PNGs, so the original HU values
+are gone. The script feeds the grayscale image to both models replicated
+across the 3 input channels (no multi-window for the ischemic model). Treat
+the numbers as a practical baseline rather than a fully apples-to-apples
+evaluation.
+
 ## Hemorrhage Thresholds (Youden-Optimal)
 
 | Subtype | Threshold |
