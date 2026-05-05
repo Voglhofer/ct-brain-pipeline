@@ -742,6 +742,155 @@ def visualize_patient_summary(all_results: list[dict], patient_agg: dict,
     plt.close()
 
 
+def visualize_patient_diagnosis(patient_agg: dict, patient_meta: dict | None,
+                                out_path: Path):
+    """
+    One-page final diagnosis card: two large panels (hemorrhage / ischemic)
+    each showing max probability, threshold, status and #positive slices.
+    Also lists per-subtype hemorrhage probabilities.
+    """
+    hem = patient_agg.get("hemorrhage", {})
+    isch = patient_agg.get("ischemic", {})
+    hem_subs = hem.get("subtypes", {})
+    hem_pos = hem.get("patient_positive", False)
+    isch_pos = isch.get("patient_positive", False)
+    hem_prob = hem_subs.get("any", {}).get("max_probability", 0.0)
+    isch_prob = isch.get("max_probability", 0.0)
+    hem_thr = HEMORRHAGE_THRESHOLDS.get("any", 0.37)
+    isch_thr = 0.5
+    n_total = isch.get("n_total_slices", hem.get("n_total_slices", 0))
+    hem_npos = hem.get("n_positive_slices", 0)
+    isch_npos = isch.get("n_positive_slices", 0)
+
+    pid = (patient_meta or {}).get("PatientID", "")
+    title = f"Final diagnosis — {pid}" if pid and pid != "Unknown" else "Final diagnosis"
+
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 2], hspace=0.35, wspace=0.18)
+    fig.suptitle(title, fontsize=15, fontweight="bold", y=0.98)
+
+    def _card(ax, label, prob, thr, pos, npos):
+        color = "#e74c3c" if pos else "#27ae60"
+        status = "POSITIVE" if pos else "NEGATIVE"
+        ax.text(0.5, 0.86, label, ha="center", va="center",
+                transform=ax.transAxes, fontsize=14, color="#2c3e50",
+                fontweight="bold")
+        ax.text(0.5, 0.55, f"{prob:.3f}", ha="center", va="center",
+                transform=ax.transAxes, fontsize=64, fontweight="bold",
+                color=color)
+        ax.text(0.5, 0.32, f"({prob * 100:.2f}%)", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14, color=color)
+        ax.text(0.5, 0.18, f"threshold {thr:.2f}", ha="center", va="center",
+                transform=ax.transAxes, fontsize=11, color="#7f8c8d")
+        ax.text(0.5, 0.06, f"{status}   |   {npos}/{n_total} positive slices",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=13, fontweight="bold", color=color)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(2.5)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+
+    ax_h = fig.add_subplot(gs[0, 0])
+    _card(ax_h, "HEMORRHAGE  (any)", hem_prob, hem_thr, hem_pos, hem_npos)
+    ax_i = fig.add_subplot(gs[0, 1])
+    _card(ax_i, "ISCHEMIC  STROKE", isch_prob, isch_thr, isch_pos, isch_npos)
+
+    # Per-subtype hemorrhage breakdown
+    ax_b = fig.add_subplot(gs[1, :])
+    SUB_ORDER = ["any", "epidural", "intraparenchymal", "intraventricular",
+                 "subarachnoid", "subdural"]
+    SUB_COLORS = {
+        "any": "#e74c3c", "epidural": "#e67e22",
+        "intraparenchymal": "#2980b9", "intraventricular": "#8e44ad",
+        "subarachnoid": "#27ae60", "subdural": "#f39c12",
+    }
+    labels = [s for s in SUB_ORDER if s in hem_subs]
+    probs = [hem_subs[s]["max_probability"] for s in labels]
+    pos_flags = [hem_subs[s]["patient_positive"] for s in labels]
+    colors = [SUB_COLORS[s] for s in labels]
+    y = np.arange(len(labels))
+    ax_b.barh(y, probs, color=colors, alpha=0.85, edgecolor="white")
+    ax_b.set_yticks(y); ax_b.set_yticklabels(labels, fontsize=10)
+    ax_b.invert_yaxis()
+    ax_b.set_xlim(0, 1.15)
+    ax_b.set_xlabel("max probability across slices")
+    ax_b.set_title("Hemorrhage subtypes (patient-level max)",
+                   fontsize=11, fontweight="bold")
+    ax_b.axvline(hem_thr, color="#7f8c8d", linestyle="--", linewidth=1, alpha=0.6)
+    for i, (p, flag, col) in enumerate(zip(probs, pos_flags, colors)):
+        marker = "  \u2713" if flag else ""
+        ax_b.text(p + 0.015, i, f"{p:.3f}{marker}", va="center", fontsize=9,
+                  fontweight="bold" if flag else "normal", color=col)
+    ax_b.grid(True, axis="x", alpha=0.25)
+
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def visualize_top_slices(all_results: list[dict], images_hu: list[np.ndarray],
+                         patient_meta: dict | None, out_path: Path,
+                         k: int = 6):
+    """
+    Show the k slices with the highest combined prediction probability
+    (max of p(hemorrhage-any) and p(ischemic)). Each tile shows the
+    brain-window CT plus both probabilities.
+    """
+    n = len(all_results)
+    if n == 0 or len(images_hu) == 0:
+        return
+    k = min(k, n)
+
+    scored = []
+    for r in all_results:
+        i = r["slice_index"]
+        ph = r["results"]["hemorrhage"]["any"]["probability"]
+        pi = r["results"]["ischemic"]["ischemic_stroke"]["probability"]
+        scored.append((i, ph, pi, max(ph, pi)))
+    scored.sort(key=lambda t: t[3], reverse=True)
+    top = scored[:k]
+
+    hem_thr = HEMORRHAGE_THRESHOLDS.get("any", 0.37)
+    isch_thr = 0.5
+
+    cols = 3 if k >= 3 else k
+    rows = int(np.ceil(k / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5.2 * rows))
+    axes = np.atleast_2d(axes).reshape(rows, cols)
+
+    pid = (patient_meta or {}).get("PatientID", "")
+    title = (f"Top {k} slices by max probability — {pid}"
+             if pid and pid != "Unknown"
+             else f"Top {k} slices by max probability")
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=0.995)
+
+    for ax, (i, ph, pi, _s) in zip(axes.flat, top):
+        if 0 <= i < len(images_hu):
+            img = apply_window(images_hu[i], center=40, width=80)
+            ax.imshow(img, cmap="gray", aspect="equal")
+        ax.set_xticks([]); ax.set_yticks([])
+        hem_pos = ph >= hem_thr
+        isch_pos = pi >= isch_thr
+        hem_col = "#e74c3c" if hem_pos else "#27ae60"
+        isch_col = "#e74c3c" if isch_pos else "#27ae60"
+        ax.set_title(f"slice {i}", fontsize=11, fontweight="bold")
+        # Probability badges below image
+        ax.text(0.02, -0.04, f"hem {ph:.3f}", transform=ax.transAxes,
+                ha="left", va="top", fontsize=10, color=hem_col,
+                fontweight="bold" if hem_pos else "normal")
+        ax.text(0.98, -0.04, f"isch {pi:.3f}", transform=ax.transAxes,
+                ha="right", va="top", fontsize=10, color=isch_col,
+                fontweight="bold" if isch_pos else "normal")
+
+    # Hide unused axes
+    for ax in axes.flat[k:]:
+        ax.axis("off")
+
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def visualize_results(image_hu: np.ndarray, results: dict, title: str, out_path: Path):
     """Create a combined visualization showing CT scan + both model predictions."""
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
@@ -1444,8 +1593,16 @@ def main():
     print_summary(all_results, patient_meta=patient_meta,
                   patient_agg=patient_agg, show_slices=args.show_slices)
 
-    # Always write the patient-level overview plot when there are
-    # multiple slices — this is the easiest way to see which slices fired.
+    # Always write the three patient-level result plots when there are
+    # multiple slices: final diagnosis card, per-slice probability summary,
+    # and the top-6 highest-probability slices.
+    diagnosis_plot = out_dir / "final_diagnosis.png"
+    try:
+        visualize_patient_diagnosis(patient_agg, patient_meta, diagnosis_plot)
+        print(f"Final diagnosis plot: {diagnosis_plot}")
+    except Exception as e:
+        print(f"  WARNING: could not save final diagnosis plot: {e}")
+
     if len(all_results) > 1:
         summary_plot = out_dir / "patient_summary.png"
         try:
@@ -1454,6 +1611,14 @@ def main():
             print(f"Patient summary plot: {summary_plot}")
         except Exception as e:
             print(f"  WARNING: could not save patient summary plot: {e}")
+
+        top_plot = out_dir / "top_slices.png"
+        try:
+            visualize_top_slices(all_results, images_hu, patient_meta,
+                                 top_plot, k=6)
+            print(f"Top slices plot:      {top_plot}")
+        except Exception as e:
+            print(f"  WARNING: could not save top-slices plot: {e}")
 
     results_path = out_dir / "results.json"
     with open(results_path, "w") as f:
