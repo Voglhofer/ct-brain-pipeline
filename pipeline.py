@@ -105,6 +105,13 @@ def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
 
     Assumes the volume is already calibrated in HU (standard for NIfTI CT).
     Reorients to canonical RAS so the last axis is axial (superior +Z).
+
+    Robustness: some publicly available NIfTI files (notably some nnUNet
+    preprocessed datasets) ship with a broken affine where the in-plane vs.
+    slice axes are mislabeled. We detect this by checking the Z-extent
+    (head height should be roughly 80-350 mm) and, if implausible, fall
+    back to using the axis with the largest voxel spacing as the slice
+    axis (which is what clinical CT looks like in practice).
     """
     img = nib.load(str(nii_path))
     # Reorient to canonical RAS — last axis becomes superior-inferior (axial slices).
@@ -121,12 +128,62 @@ def nifti_to_hu_slices(nii_path: Path) -> tuple[list[np.ndarray], dict]:
         raise ValueError(f"Expected 3D NIfTI volume, got shape {data.shape} in {nii_path}")
 
     # data shape after canonical reorient: (X, Y, Z) with Z = axial
-    n_slices = data.shape[2]
-    slices = [data[:, :, i].T.astype(np.float32) for i in range(n_slices)]
-    # .T so rows = Y (anterior→posterior visually flipped to standard radiologic view)
+    zooms = tuple(float(z) for z in zooms[:3])
+    extents = tuple(s * z for s, z in zip(data.shape, zooms))
 
-    z_thickness = float(zooms[2]) if len(zooms) >= 3 else None
-    px_spacing = (float(zooms[0]), float(zooms[1])) if len(zooms) >= 2 else None
+    slice_axis = 2  # canonical RAS → Z is last
+    z_thickness = zooms[slice_axis]
+    in_plane_axes = [a for a in (0, 1, 2) if a != slice_axis]
+
+    # Sanity check: a real head CT spans ~80-350 mm superior-inferior, has
+    # ~10-400 slices, and in-plane voxels are typically ≤ 1.5 mm.  If the
+    # canonical Z-axis violates these, the affine is almost certainly
+    # mis-assembled (we have seen this on some nnUNet-preprocessed datasets
+    # where shape=(96,512,512) but zooms=(0.5,0.5,3.0) — the slice axis is
+    # axis 0 with thickness 3.0 mm, but the affine puts thickness on axis 2).
+    z_extent = extents[slice_axis]
+    in_plane_max = max(zooms[a] for a in in_plane_axes)
+    affine_looks_wrong = (
+        not (80.0 <= z_extent <= 350.0)
+        or in_plane_max > 1.5
+        or data.shape[slice_axis] > 600
+    )
+
+    if affine_looks_wrong:
+        # Heuristic: slice axis has the fewest voxels; slice thickness is
+        # the largest zoom value. Treat them independently because the
+        # broken affine may have them on different axes.
+        guessed_axis = int(np.argmin(data.shape))
+        guessed_thk = float(max(zooms))
+        guessed_extent = data.shape[guessed_axis] * guessed_thk
+        if 60.0 <= guessed_extent <= 400.0:
+            print(f"  WARNING: NIfTI affine looks broken "
+                  f"(canonical: axis {slice_axis}, extent {z_extent:.0f} mm, "
+                  f"in-plane max {in_plane_max:.2f} mm). "
+                  f"Falling back to axis {guessed_axis} as slice axis with "
+                  f"thickness {guessed_thk:.2f} mm "
+                  f"(extent {guessed_extent:.0f} mm).")
+            slice_axis = guessed_axis
+            z_thickness = guessed_thk
+            in_plane_axes = [a for a in (0, 1, 2) if a != slice_axis]
+
+    n_slices = data.shape[slice_axis]
+
+    # Extract axial slices. Each slice should be 2D in_plane × in_plane.
+    # Using .T so rows = first in-plane axis (matches the rest of the
+    # pipeline's convention for HU images).
+    slices: list[np.ndarray] = [
+        np.take(data, i, axis=slice_axis).T.astype(np.float32)
+        for i in range(n_slices)
+    ]
+
+    # In-plane spacing: when affine was wrong, fall back to the smaller of
+    # the remaining zooms (typical head CT has equal x/y, ~0.4-1 mm).
+    if affine_looks_wrong:
+        remaining = sorted(zooms[a] for a in in_plane_axes)
+        px_spacing = (remaining[0], remaining[0])  # assume isotropic in-plane
+    else:
+        px_spacing = (zooms[in_plane_axes[0]], zooms[in_plane_axes[1]])
 
     meta = {
         "PatientID": nii_path.stem.replace(".nii", ""),
