@@ -608,6 +608,83 @@ def run_pipeline_batched(
 
 # ── Visualization ──────────────────────────────────────────────────────────
 
+def visualize_patient_summary(all_results: list[dict], patient_agg: dict,
+                              patient_meta: dict | None, out_path: Path):
+    """
+    Patient-level overview: probability vs. slice index for hemorrhage (any)
+    and ischemic, with thresholds and positive slices clearly marked.
+    """
+    n = len(all_results)
+    if n == 0:
+        return
+
+    slice_idx = [r["slice_index"] for r in all_results]
+    hem_probs = [r["results"]["hemorrhage"]["any"]["probability"] for r in all_results]
+    isch_probs = [r["results"]["ischemic"]["ischemic_stroke"]["probability"]
+                  for r in all_results]
+
+    hem_thresh = HEMORRHAGE_THRESHOLDS["any"]
+    isch_thresh = all_results[0]["results"]["ischemic"]["ischemic_stroke"].get(
+        "threshold", 0.5)
+
+    hem_pos_idx = patient_agg["hemorrhage"]["subtypes"]["any"]["positive_slice_indices"]
+    isch_pos_idx = patient_agg["ischemic"]["positive_slice_indices"]
+
+    hem_patient_prob = patient_agg["hemorrhage"]["subtypes"]["any"]["max_probability"]
+    isch_patient_prob = patient_agg["ischemic"]["max_probability"]
+    hem_pos = patient_agg["hemorrhage"]["patient_positive"]
+    isch_pos = patient_agg["ischemic"]["patient_positive"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    pid = (patient_meta or {}).get("PatientID", "")
+    title = f"Patient summary — {pid}" if pid and pid != "Unknown" else "Patient summary"
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+
+    # --- Hemorrhage (any) ---
+    ax = axes[0]
+    ax.plot(slice_idx, hem_probs, color="#34495e", linewidth=1.4, alpha=0.8)
+    ax.scatter(slice_idx, hem_probs, s=18, color="#34495e", alpha=0.6)
+    pos_x = [s for s, p in zip(slice_idx, hem_probs) if s in set(hem_pos_idx)]
+    pos_y = [p for s, p in zip(slice_idx, hem_probs) if s in set(hem_pos_idx)]
+    if pos_x:
+        ax.scatter(pos_x, pos_y, s=70, color="#e74c3c", edgecolor="white",
+                   linewidth=1.2, zorder=5, label=f"positive ({len(pos_x)})")
+    ax.axhline(hem_thresh, color="#e74c3c", linestyle="--", linewidth=1,
+               alpha=0.7, label=f"threshold {hem_thresh:.2f}")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_ylabel("p(hemorrhage)")
+    flag = "POSITIVE" if hem_pos else "negative"
+    ax.set_title(f"Hemorrhage (any)   max={hem_patient_prob:.3f}   →  {flag}",
+                 fontsize=11, color="#e74c3c" if hem_pos else "#27ae60")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    # --- Ischemic ---
+    ax = axes[1]
+    ax.plot(slice_idx, isch_probs, color="#34495e", linewidth=1.4, alpha=0.8)
+    ax.scatter(slice_idx, isch_probs, s=18, color="#34495e", alpha=0.6)
+    pos_x = [s for s, p in zip(slice_idx, isch_probs) if s in set(isch_pos_idx)]
+    pos_y = [p for s, p in zip(slice_idx, isch_probs) if s in set(isch_pos_idx)]
+    if pos_x:
+        ax.scatter(pos_x, pos_y, s=70, color="#e74c3c", edgecolor="white",
+                   linewidth=1.2, zorder=5, label=f"positive ({len(pos_x)})")
+    ax.axhline(isch_thresh, color="#e74c3c", linestyle="--", linewidth=1,
+               alpha=0.7, label=f"threshold {isch_thresh:.2f}")
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_ylabel("p(ischemic)")
+    ax.set_xlabel("slice index")
+    flag = "POSITIVE" if isch_pos else "negative"
+    ax.set_title(f"Ischemic stroke   max={isch_patient_prob:.3f}   →  {flag}",
+                 fontsize=11, color="#e74c3c" if isch_pos else "#27ae60")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.25)
+
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def visualize_results(image_hu: np.ndarray, results: dict, title: str, out_path: Path):
     """Create a combined visualization showing CT scan + both model predictions."""
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
@@ -657,36 +734,32 @@ def visualize_results(image_hu: np.ndarray, results: dict, title: str, out_path:
     axes[1].text(0.5, -0.12, status_text, transform=axes[1].transAxes,
                  ha="center", fontsize=12, fontweight="bold", color=status_color)
 
-    # Panel 3: Ischemic prediction (gauge)
+    # Panel 3: Ischemic prediction (clean number readout)
     isch = results["ischemic"]["ischemic_stroke"]
     isch_prob = isch["probability"]
     isch_pos = isch["positive"]
-
-    theta = np.linspace(0, np.pi, 100)
-    axes[2].plot(np.cos(theta), np.sin(theta), color="#bdc3c7", linewidth=8)
-
-    n_fill = int(isch_prob * 100)
+    isch_thresh = isch.get("threshold", 0.5)
     fill_color = "#e74c3c" if isch_pos else "#27ae60"
-    if n_fill > 0:
-        theta_fill = np.linspace(0, np.pi * isch_prob, n_fill)
-        axes[2].plot(np.cos(theta_fill), np.sin(theta_fill),
-                     color=fill_color, linewidth=10)
 
-    needle_angle = np.pi * (1 - isch_prob)
-    axes[2].annotate("", xy=(0.7 * np.cos(needle_angle), 0.7 * np.sin(needle_angle)),
-                     xytext=(0, 0),
-                     arrowprops=dict(arrowstyle="->", color="#2c3e50", lw=2))
-
-    axes[2].text(0, -0.15, f"{isch_prob:.1%}", ha="center", fontsize=24,
-                 fontweight="bold", color=fill_color)
-
+    axes[2].text(0.5, 0.78, "Ischemic stroke probability",
+                 ha="center", va="center", transform=axes[2].transAxes,
+                 fontsize=12, color="#2c3e50")
+    axes[2].text(0.5, 0.50, f"{isch_prob:.3f}",
+                 ha="center", va="center", transform=axes[2].transAxes,
+                 fontsize=48, fontweight="bold", color=fill_color)
+    axes[2].text(0.5, 0.28, f"({isch_prob*100:.2f}%)",
+                 ha="center", va="center", transform=axes[2].transAxes,
+                 fontsize=14, color=fill_color)
+    axes[2].text(0.5, 0.14, f"threshold {isch_thresh:.2f}",
+                 ha="center", va="center", transform=axes[2].transAxes,
+                 fontsize=10, color="#7f8c8d")
     isch_status = "ISCHEMIC STROKE DETECTED" if isch_pos else "No ischemic stroke"
-    axes[2].text(0, -0.35, isch_status, ha="center", fontsize=12,
-                 fontweight="bold", color=fill_color)
+    axes[2].text(0.5, 0.02, isch_status,
+                 ha="center", va="center", transform=axes[2].transAxes,
+                 fontsize=12, fontweight="bold", color=fill_color)
 
-    axes[2].set_xlim(-1.2, 1.2)
-    axes[2].set_ylim(-0.5, 1.2)
-    axes[2].set_aspect("equal")
+    axes[2].set_xlim(0, 1)
+    axes[2].set_ylim(0, 1)
     axes[2].set_title("Ischemic Stroke Detection", fontsize=11, fontweight="bold")
     axes[2].axis("off")
 
@@ -1015,6 +1088,28 @@ def print_summary(all_results: list[dict], patient_meta: dict | None = None,
                 print(f"    {marker} {label:18s} {sub['max_probability']*100:6.2f}%   "
                       f"(threshold {HEMORRHAGE_THRESHOLDS[label]*100:.2f}%)")
 
+        # Always surface which slices fired (helps localise the finding)
+        def _fmt_slices(idx_list, total_n):
+            if not idx_list:
+                return "  (none)"
+            shown = idx_list if len(idx_list) <= 20 else idx_list[:20] + ["..."]
+            return "  " + ", ".join(str(s) for s in shown) + f"   [{len(idx_list)}/{total_n}]"
+
+        hem_any_idx = hem["subtypes"]["any"]["positive_slice_indices"]
+        isch_idx    = isch["positive_slice_indices"]
+
+        print("\n  Slices flagged HEMORRHAGE (any):")
+        print(_fmt_slices(hem_any_idx, n_total))
+        if hem["patient_positive"]:
+            for label in HEMORRHAGE_LABELS[1:]:
+                sub = hem["subtypes"][label]
+                if sub["patient_positive"]:
+                    print(f"    - {label}:")
+                    print("    " + _fmt_slices(sub["positive_slice_indices"], n_total))
+
+        print("\n  Slices flagged ISCHEMIC:")
+        print(_fmt_slices(isch_idx, n_total))
+
         print(f"\n{'=' * 70}")
 
     if show_slices and n_total > 0:
@@ -1291,6 +1386,17 @@ def main():
     # ── Print and save results ─────────────────────────────────────────
     print_summary(all_results, patient_meta=patient_meta,
                   patient_agg=patient_agg, show_slices=args.show_slices)
+
+    # Always write the patient-level overview plot when there are
+    # multiple slices — this is the easiest way to see which slices fired.
+    if len(all_results) > 1:
+        summary_plot = out_dir / "patient_summary.png"
+        try:
+            visualize_patient_summary(all_results, patient_agg,
+                                      patient_meta, summary_plot)
+            print(f"Patient summary plot: {summary_plot}")
+        except Exception as e:
+            print(f"  WARNING: could not save patient summary plot: {e}")
 
     results_path = out_dir / "results.json"
     with open(results_path, "w") as f:
