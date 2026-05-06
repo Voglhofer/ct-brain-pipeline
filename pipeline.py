@@ -830,11 +830,11 @@ def visualize_patient_diagnosis(patient_agg: dict, patient_meta: dict | None,
 
 def visualize_top_slices(all_results: list[dict], images_hu: list[np.ndarray],
                          patient_meta: dict | None, out_path: Path,
-                         k: int = 6):
+                         k: int = 3):
     """
-    Show the k slices with the highest combined prediction probability
-    (max of p(hemorrhage-any) and p(ischemic)). Each tile shows the
-    brain-window CT plus both probabilities.
+    2-row layout: top row = k slices with highest p(hemorrhage),
+                  bottom row = k slices with highest p(ischemic).
+    Each tile shows the brain-window CT and both probabilities.
     """
     n = len(all_results)
     if n == 0 or len(images_hu) == 0:
@@ -846,35 +846,42 @@ def visualize_top_slices(all_results: list[dict], images_hu: list[np.ndarray],
         i = r["slice_index"]
         ph = r["results"]["hemorrhage"]["any"]["probability"]
         pi = r["results"]["ischemic"]["ischemic_stroke"]["probability"]
-        scored.append((i, ph, pi, max(ph, pi)))
-    scored.sort(key=lambda t: t[3], reverse=True)
-    top = scored[:k]
+        scored.append((i, ph, pi))
+
+    top_hem = sorted(scored, key=lambda t: t[1], reverse=True)[:k]
+    top_isch = sorted(scored, key=lambda t: t[2], reverse=True)[:k]
 
     hem_thr = HEMORRHAGE_THRESHOLDS.get("any", 0.37)
     isch_thr = 0.5
 
-    cols = 3 if k >= 3 else k
-    rows = int(np.ceil(k / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5.2 * rows))
-    axes = np.atleast_2d(axes).reshape(rows, cols)
+    fig, axes = plt.subplots(2, k, figsize=(5 * k, 10.5))
+    axes = np.atleast_2d(axes)
 
     pid = (patient_meta or {}).get("PatientID", "")
-    title = (f"Top {k} slices by max probability — {pid}"
-             if pid and pid != "Unknown"
-             else f"Top {k} slices by max probability")
+    title = (f"Top slices — {pid}" if pid and pid != "Unknown" else "Top slices")
     fig.suptitle(title, fontsize=14, fontweight="bold", y=0.995)
 
-    for ax, (i, ph, pi, _s) in zip(axes.flat, top):
+    # Row labels
+    fig.text(0.01, 0.74, "Hemorrhage", va="center", rotation="vertical",
+             fontsize=12, fontweight="bold", color="#e67e22")
+    fig.text(0.01, 0.27, "Ischemic", va="center", rotation="vertical",
+             fontsize=12, fontweight="bold", color="#2980b9")
+
+    def _draw_tile(ax, i, ph, pi, highlight):
         if 0 <= i < len(images_hu):
             img = apply_window(images_hu[i], center=40, width=80)
             ax.imshow(img, cmap="gray", aspect="equal")
         ax.set_xticks([]); ax.set_yticks([])
+        # Colored border for the highlighted metric
+        border_col = "#e67e22" if highlight == "hem" else "#2980b9"
+        for spine in ax.spines.values():
+            spine.set_edgecolor(border_col)
+            spine.set_linewidth(3)
         hem_pos = ph >= hem_thr
         isch_pos = pi >= isch_thr
         hem_col = "#e74c3c" if hem_pos else "#27ae60"
         isch_col = "#e74c3c" if isch_pos else "#27ae60"
         ax.set_title(f"slice {i}", fontsize=11, fontweight="bold")
-        # Probability badges below image
         ax.text(0.02, -0.04, f"hem {ph:.3f}", transform=ax.transAxes,
                 ha="left", va="top", fontsize=10, color=hem_col,
                 fontweight="bold" if hem_pos else "normal")
@@ -882,11 +889,12 @@ def visualize_top_slices(all_results: list[dict], images_hu: list[np.ndarray],
                 ha="right", va="top", fontsize=10, color=isch_col,
                 fontweight="bold" if isch_pos else "normal")
 
-    # Hide unused axes
-    for ax in axes.flat[k:]:
-        ax.axis("off")
+    for col, (i, ph, pi) in enumerate(top_hem):
+        _draw_tile(axes[0, col], i, ph, pi, highlight="hem")
+    for col, (i, ph, pi) in enumerate(top_isch):
+        _draw_tile(axes[1, col], i, ph, pi, highlight="isch")
 
-    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.tight_layout(rect=(0.03, 0, 1, 0.96))
     plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1615,7 +1623,7 @@ def main():
         top_plot = out_dir / "top_slices.png"
         try:
             visualize_top_slices(all_results, images_hu, patient_meta,
-                                 top_plot, k=6)
+                                 top_plot, k=3)
             print(f"Top slices plot:      {top_plot}")
         except Exception as e:
             print(f"  WARNING: could not save top-slices plot: {e}")
