@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
 """
-Evaluate the CT brain pipeline on the Kaggle Brain Stroke CT Dataset.
-====================================================================
-Dataset: ozguraslank/brain-stroke-ct-dataset
+Evaluate the (current) ct-brain-pipeline on the Kaggle Brain Stroke CT
+Dataset (ozguraslank/brain-stroke-ct-dataset).
 
-This dataset contains 2D PNG/JPG CT slices already brain-windowed and
-organised by class (Bleeding / Ischemia / Normal / External_Test) — i.e.
-NOT raw DICOM/NIfTI volumes with Hounsfield Units.
+This rewrite uses the **DICOM** files (with native HU) rather than the
+pre-windowed PNG mirrors used by the original evaluate_kaggle.py. That
+removes the lossy pseudo-HU reconstruction step.
 
-Because the original HU values are lost, we feed the pre-windowed grayscale
-image directly to both models (replicated across the 3 input channels).
-Results are therefore a *practical baseline* on this dataset, not a
-fully apples-to-apples evaluation.
-
-What the script does:
-  1. Downloads the dataset via kagglehub (cached locally).
-  2. Iterates over every image in Bleeding / Ischemia / Normal.
-  3. Runs the hemorrhage 5-fold ensemble + ischemic classifier per slice.
-  4. Compares predictions vs. ground-truth folder label.
-  5. Writes per-image CSV + per-class accuracy / confusion matrix.
+The dataset is organised by class (Bleeding / Ischemia / Normal /
+External_Test) with one DICOM file per slice (no patient series), so we
+treat each .dcm as an independent slice and use the single-slice
+preprocessing helpers from pipeline.py.
 
 Usage:
-  python evaluate_kaggle.py                    # default: all 3 classes, GPU if available
-  python evaluate_kaggle.py --device cuda
-  python evaluate_kaggle.py --limit 100        # quick smoke test
-  python evaluate_kaggle.py --output-dir output_kaggle/
+  python evaluate_kaggle.py                    # all 3 classes, MPS/CUDA if available
+  python evaluate_kaggle.py --limit 5          # smoke test
+  python evaluate_kaggle.py --output-dir output_kaggle_v2
 """
 
 from __future__ import annotations
@@ -33,18 +24,17 @@ import argparse
 import csv
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
 
-# Reuse model loaders + inference from the main pipeline
 from pipeline import (
     HEMORRHAGE_LABELS,
     HEMORRHAGE_MODEL_DIR,
+    HEMORRHAGE_THRESHOLDS,
     ISCHEMIC_MODEL_PATH,
+    dicom_to_hu,
     load_hemorrhage_models,
     load_ischemic_model,
     predict_hemorrhage_batch,
@@ -53,103 +43,88 @@ from pipeline import (
     prepare_ischemic_input,
 )
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-
-# Kaggle dataset class folders → ground-truth labels
 GT_CLASSES = {
     "Bleeding":  {"hemorrhage": True,  "ischemic": False},
     "Ischemia":  {"hemorrhage": False, "ischemic": True},
     "Normal":    {"hemorrhage": False, "ischemic": False},
 }
 
-# The Kaggle PNGs are pre-windowed with the standard brain window.
-# Inverting that window recovers pseudo-HU values in the [0, 80] HU range,
-# which lets us run the pipeline's real preprocessing (multi-window for the
-# ischemic model in particular). HU outside [0, 80] is clipped, but the
-# stroke window (center=32, width=8 → HU [28, 36]) and brain window
-# (center=40, width=80 → HU [0, 80]) both live inside that range, so most
-# diagnostically useful contrast is preserved.
-BRAIN_WINDOW_CENTER = 40.0
-BRAIN_WINDOW_WIDTH = 80.0
+# Ischemic model output threshold (matches pipeline default)
+ISCHEMIC_THRESHOLD = 0.5
 
 
-# ── Image loading & preprocessing ──────────────────────────────────────────
+# ── AUC helpers (numpy-only, no sklearn) ─────────────────────────────────
 
-def load_image_as_pseudo_hu(path: Path) -> np.ndarray:
-    """
-    Load a Kaggle PNG and invert the brain window to pseudo-HU.
+def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    pos = y_score[y_true == 1]; neg = y_score[y_true == 0]
+    if pos.size == 0 or neg.size == 0:
+        return float("nan")
+    order = np.argsort(y_score, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(y_score) + 1)
+    s = y_score[order]
+    i = 0
+    while i < len(s):
+        j = i
+        while j + 1 < len(s) and s[j + 1] == s[i]:
+            j += 1
+        if j > i:
+            avg = (ranks[order[i]] + ranks[order[j]]) / 2.0
+            for k in range(i, j + 1):
+                ranks[order[k]] = avg
+        i = j + 1
+    n_pos = pos.size; n_neg = neg.size
+    rs = ranks[y_true == 1].sum()
+    return float((rs - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
-    NOTE: the dataset's Bleeding / Ischemia images are stored as RGBA with
-    very small differences between R/G/B (presumably multi-window encoded),
-    while Normal images are pure grayscale. Using channel differences would
-    be a label leak, so we collapse to luminance via cv2.IMREAD_GRAYSCALE.
-    """
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError(f"Could not read image: {path}")
-    if img.shape != (512, 512):
-        img = cv2.resize(img, (512, 512))
 
-    low = BRAIN_WINDOW_CENTER - BRAIN_WINDOW_WIDTH / 2  # 0 HU
-    high = BRAIN_WINDOW_CENTER + BRAIN_WINDOW_WIDTH / 2  # 80 HU
-    return img.astype(np.float32) / 255.0 * (high - low) + low
+def bootstrap_auc_ci(y_true, y_score, n_boot=1000, seed=42):
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    aucs = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        a = roc_auc(y_true[idx], y_score[idx])
+        if not np.isnan(a):
+            aucs.append(a)
+    if not aucs:
+        return float("nan"), float("nan")
+    return float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))
 
 
-def collect_images(root: Path, classes: list[str], limit: int | None) -> list[tuple[Path, str]]:
-    """Return list of (image_path, class_label) for every image under root/<class>/**."""
-    items: list[tuple[Path, str]] = []
+# ── Image loading ────────────────────────────────────────────────────────
+
+def collect_dicoms(root: Path, classes: list[str], limit: int | None):
+    items = []
     for cls in classes:
-        cls_dir = root / cls
-        if not cls_dir.exists():
-            print(f"  WARNING: class folder not found: {cls_dir}")
+        cls_dir = root / cls / "DICOM"
+        if not cls_dir.is_dir():
+            print(f"  WARNING: missing {cls_dir}")
             continue
-        files = [p for p in cls_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
-        files.sort()
-        if limit is not None:
+        files = sorted(cls_dir.glob("*.dcm"))
+        if limit:
             files = files[:limit]
         items.extend((p, cls) for p in files)
-        print(f"  {cls}: {len(files)} image(s)")
+        print(f"  {cls}: {len(files)} DICOM(s)")
     return items
 
 
 def find_dataset_root(download_path: Path) -> Path:
-    """
-    kagglehub returns the dataset root, but this dataset nests everything
-    inside Brain_Stroke_CT_Dataset/. Walk down to the first directory that
-    contains at least one of the expected class folders.
-    """
-    candidates = [download_path] + [p for p in download_path.rglob("*") if p.is_dir()]
-    for c in candidates:
+    for c in [download_path] + [p for p in download_path.rglob("*") if p.is_dir()]:
         if any((c / cls).is_dir() for cls in GT_CLASSES):
             return c
-    raise FileNotFoundError(
-        f"Could not locate Bleeding/Ischemia/Normal folders under {download_path}"
-    )
+    raise FileNotFoundError(f"Could not find Bleeding/Ischemia/Normal under {download_path}")
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────
+# ── Evaluation ───────────────────────────────────────────────────────────
 
-def evaluate(
-    items: list[tuple[Path, str]],
-    hem_models: list,
-    isch_model: torch.nn.Module,
-    device: torch.device,
-    batch_size: int,
-    csv_path: Path,
-) -> dict:
-    """Run both models on all images, write per-image CSV, return aggregated stats."""
+def evaluate(items, hem_models, isch_model, device, batch_size, csv_path):
     n = len(items)
-    print(f"\nRunning inference on {n} image(s) (batch size {batch_size})…")
-
-    # Per-class counters
-    stats: dict = {
-        cls: {
-            "n": 0,
-            "hem_tp": 0, "hem_fp": 0, "hem_tn": 0, "hem_fn": 0,
-            "isch_tp": 0, "isch_fp": 0, "isch_tn": 0, "isch_fn": 0,
-        }
-        for cls in GT_CLASSES
-    }
+    print(f"\nRunning inference on {n} slice(s) (batch size {batch_size})…")
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -159,20 +134,18 @@ def evaluate(
         "gt_ischemic", "pred_ischemic", "p_ischemic",
     ]
 
+    rows = []
     t0 = time.time()
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
 
-        # Process in batches to keep memory bounded
         for start in range(0, n, batch_size):
             batch = items[start:start + batch_size]
             hem_inputs, isch_inputs, valid = [], [], []
             for path, cls in batch:
                 try:
-                    hu = load_image_as_pseudo_hu(path)
-                    # Use the pipeline's real preprocessing — brain window for
-                    # hemorrhage, multi-window (brain/stroke/soft) for ischemic.
+                    hu = dicom_to_hu(str(path))
                     hem_inputs.append(prepare_hemorrhage_input(hu))
                     isch_inputs.append(prepare_ischemic_input(hu))
                     valid.append((path, cls))
@@ -188,7 +161,6 @@ def evaluate(
                 gt = GT_CLASSES[cls]
                 pred_hem = hem["any"]["positive"]
                 pred_isch = isch["ischemic_stroke"]["positive"]
-
                 row = {
                     "file": str(path),
                     "class": cls,
@@ -202,194 +174,237 @@ def evaluate(
                 for l in HEMORRHAGE_LABELS:
                     row[f"p_{l}"] = hem[l]["probability"]
                 writer.writerow(row)
-
-                s = stats[cls]
-                s["n"] += 1
-                # hemorrhage confusion
-                if gt["hemorrhage"] and pred_hem:        s["hem_tp"] += 1
-                elif gt["hemorrhage"] and not pred_hem:  s["hem_fn"] += 1
-                elif not gt["hemorrhage"] and pred_hem:  s["hem_fp"] += 1
-                else:                                    s["hem_tn"] += 1
-                # ischemic confusion
-                if gt["ischemic"] and pred_isch:         s["isch_tp"] += 1
-                elif gt["ischemic"] and not pred_isch:   s["isch_fn"] += 1
-                elif not gt["ischemic"] and pred_isch:   s["isch_fp"] += 1
-                else:                                    s["isch_tn"] += 1
+                rows.append(row)
 
             done = start + len(batch)
             if done % (batch_size * 10) == 0 or done >= n:
                 rate = done / max(time.time() - t0, 1e-6)
-                print(f"  [{done}/{n}]  {rate:.1f} img/s")
+                eta = (n - done) / max(rate, 1e-6)
+                print(f"  [{done}/{n}]  {rate:.1f} img/s  eta {eta/60:.1f} min")
 
     elapsed = time.time() - t0
     print(f"\nDone in {elapsed:.1f}s ({n / max(elapsed, 1e-6):.1f} img/s)")
-    return stats
+    return rows
 
 
-def print_report(stats: dict) -> None:
-    print("\n" + "=" * 72)
-    print("  PER-CLASS RESULTS")
-    print("=" * 72)
-    for cls, s in stats.items():
-        if s["n"] == 0:
+def metrics(tp, fp, tn, fn):
+    acc = (tp + tn) / max(tp + fp + tn + fn, 1)
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    spec = tn / max(tn + fp, 1)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+    return acc, prec, rec, spec, f1
+
+
+def print_report(rows, log_lines):
+    def p(s=""):
+        print(s); log_lines.append(s)
+
+    p("\n" + "=" * 72)
+    p(f"  Kaggle Brain Stroke CT — Slice-level results (n={len(rows)})")
+    p("=" * 72)
+
+    classes = {}
+    for r in rows:
+        classes.setdefault(r["class"], []).append(r)
+    p("\n  Per-class counts:")
+    for cls, rs in classes.items():
+        p(f"    {cls:14s} n={len(rs)}")
+
+    p("\n  Per-class binary metrics (Youden thresholds from RSNA training):")
+    for cls, rs in classes.items():
+        if cls not in GT_CLASSES:
             continue
-        gt = GT_CLASSES[cls]
-        hem_correct = s["hem_tp"] + s["hem_tn"]
-        isch_correct = s["isch_tp"] + s["isch_tn"]
-        print(f"\n  {cls}  (n={s['n']}, gt_hem={int(gt['hemorrhage'])}, gt_isch={int(gt['ischemic'])})")
-        print(f"    Hemorrhage  → acc {hem_correct/s['n']*100:6.2f}%   "
-              f"TP={s['hem_tp']} FP={s['hem_fp']} TN={s['hem_tn']} FN={s['hem_fn']}")
-        print(f"    Ischemic    → acc {isch_correct/s['n']*100:6.2f}%   "
-              f"TP={s['isch_tp']} FP={s['isch_fp']} TN={s['isch_tn']} FN={s['isch_fn']}")
+        tp=fp=tn=fn=0
+        for r in rs:
+            g, pr = int(r["gt_hemorrhage"]), int(r["pred_hemorrhage"])
+            if g and pr: tp+=1
+            elif g: fn+=1
+            elif pr: fp+=1
+            else: tn+=1
+        a,_,_,_,_ = metrics(tp,fp,tn,fn)
+        p(f"    {cls:14s} HEM   acc={a*100:6.2f}%  TP={tp} FP={fp} TN={tn} FN={fn}")
+        tp=fp=tn=fn=0
+        for r in rs:
+            g, pr = int(r["gt_ischemic"]), int(r["pred_ischemic"])
+            if g and pr: tp+=1
+            elif g: fn+=1
+            elif pr: fp+=1
+            else: tn+=1
+        a,_,_,_,_ = metrics(tp,fp,tn,fn)
+        p(f"    {' ':14s} ISCH  acc={a*100:6.2f}%  TP={tp} FP={fp} TN={tn} FN={fn}")
 
-    # Overall metrics across all classes
-    total = sum(s["n"] for s in stats.values())
-    if total == 0:
-        return
-    hem_tp = sum(s["hem_tp"] for s in stats.values())
-    hem_fp = sum(s["hem_fp"] for s in stats.values())
-    hem_tn = sum(s["hem_tn"] for s in stats.values())
-    hem_fn = sum(s["hem_fn"] for s in stats.values())
-    isch_tp = sum(s["isch_tp"] for s in stats.values())
-    isch_fp = sum(s["isch_fp"] for s in stats.values())
-    isch_tn = sum(s["isch_tn"] for s in stats.values())
-    isch_fn = sum(s["isch_fn"] for s in stats.values())
-
-    def metrics(tp, fp, tn, fn):
-        acc = (tp + tn) / max(tp + fp + tn + fn, 1)
-        prec = tp / max(tp + fp, 1)
-        rec = tp / max(tp + fn, 1)
-        spec = tn / max(tn + fp, 1)
-        f1 = 2 * prec * rec / max(prec + rec, 1e-9)
-        return acc, prec, rec, spec, f1
-
-    print("\n" + "=" * 72)
-    print(f"  OVERALL  (n={total})")
-    print("=" * 72)
-    a, p, r, sp, f1 = metrics(hem_tp, hem_fp, hem_tn, hem_fn)
-    print(f"  Hemorrhage  acc={a*100:.2f}%  prec={p*100:.2f}%  "
-          f"recall={r*100:.2f}%  spec={sp*100:.2f}%  F1={f1*100:.2f}%")
-    a, p, r, sp, f1 = metrics(isch_tp, isch_fp, isch_tn, isch_fn)
-    print(f"  Ischemic    acc={a*100:.2f}%  prec={p*100:.2f}%  "
-          f"recall={r*100:.2f}%  spec={sp*100:.2f}%  F1={f1*100:.2f}%")
-    print()
-
-
-def print_auc_report(csv_path: Path) -> None:
-    """Slice-level AUC for hemorrhage and ischemic discrimination."""
-    # Local import to avoid coupling with evaluate_ctich
-    from evaluate_ctich import roc_auc, bootstrap_auc_ci
-    import csv as _csv
-
-    rows = list(_csv.DictReader(open(csv_path)))
-    if not rows:
-        return
-
-    # Hemorrhage: positives = Bleeding, negatives = Normal (exclude Ischemia
-    # — the model isn't trained to distinguish ischemia from hemorrhage).
+    p("\n  AUC (slice-level discrimination):")
     hem_rows = [r for r in rows if r["class"] in ("Bleeding", "Normal")]
     if hem_rows:
         y = np.array([int(r["gt_hemorrhage"]) for r in hem_rows])
-        p = np.array([float(r["p_any"]) for r in hem_rows])
-        auc = roc_auc(y, p)
-        lo, hi = bootstrap_auc_ci(y, p)
-        print(f"  Hemorrhage (Bleeding vs Normal, n={len(hem_rows)})  "
-              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
-        # Per-subtype (all positives are "Bleeding" → only "any" is meaningful;
-        # subtype ground-truth is unavailable in this dataset)
-
-    # Ischemic: positives = Ischemia, negatives = Normal
+        ps = np.array([float(r["p_any"]) for r in hem_rows])
+        auc = roc_auc(y, ps); lo, hi = bootstrap_auc_ci(y, ps)
+        p(f"    Hemorrhage (Bleeding vs Normal, n={len(hem_rows)})  AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
     isch_rows = [r for r in rows if r["class"] in ("Ischemia", "Normal")]
     if isch_rows:
         y = np.array([int(r["gt_ischemic"]) for r in isch_rows])
-        p = np.array([float(r["p_ischemic"]) for r in isch_rows])
-        auc = roc_auc(y, p)
-        lo, hi = bootstrap_auc_ci(y, p)
-        print(f"  Ischemic   (Ischemia vs Normal, n={len(isch_rows)})  "
-              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
-
-    # Three-way: any-stroke (Bleeding OR Ischemia) vs Normal, using
-    # max(p_any, p_ischemic) as the combined stroke score.
+        ps = np.array([float(r["p_ischemic"]) for r in isch_rows])
+        auc = roc_auc(y, ps); lo, hi = bootstrap_auc_ci(y, ps)
+        p(f"    Ischemic   (Ischemia vs Normal, n={len(isch_rows)})  AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
     all_rows = [r for r in rows if r["class"] in ("Bleeding", "Ischemia", "Normal")]
     if all_rows:
-        y = np.array([1 if r["class"] in ("Bleeding", "Ischemia") else 0 for r in all_rows])
-        p = np.array([max(float(r["p_any"]), float(r["p_ischemic"])) for r in all_rows])
-        auc = roc_auc(y, p)
-        lo, hi = bootstrap_auc_ci(y, p)
-        print(f"  Any stroke (Bleeding+Ischemia vs Normal, n={len(all_rows)})  "
-              f"AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
-    print()
+        y = np.array([1 if r["class"] in ("Bleeding","Ischemia") else 0 for r in all_rows])
+        ps = np.array([max(float(r["p_any"]), float(r["p_ischemic"])) for r in all_rows])
+        auc = roc_auc(y, ps); lo, hi = bootstrap_auc_ci(y, ps)
+        p(f"    Any stroke (Bleeding+Ischemia vs Normal, n={len(all_rows)})  AUC={auc:.4f}  [95% CI {lo:.4f}, {hi:.4f}]")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Plots ────────────────────────────────────────────────────────────────
+
+def make_plots(rows, out_dir: Path):
+    import matplotlib.pyplot as plt
+
+    aucs, lo, hi, names = [], [], [], []
+    for name, cls in [
+        ("Hemorrhage\nvs Normal", ("Bleeding","Normal")),
+        ("Ischemia\nvs Normal",   ("Ischemia","Normal")),
+        ("Any stroke\nvs Normal", ("Bleeding","Ischemia","Normal")),
+    ]:
+        rs = [r for r in rows if r["class"] in cls]
+        if name.startswith("Hemorrhage"):
+            y = np.array([int(r["gt_hemorrhage"]) for r in rs]); ps = np.array([float(r["p_any"]) for r in rs])
+        elif name.startswith("Ischemia"):
+            y = np.array([int(r["gt_ischemic"]) for r in rs]); ps = np.array([float(r["p_ischemic"]) for r in rs])
+        else:
+            y = np.array([1 if r["class"] in ("Bleeding","Ischemia") else 0 for r in rs])
+            ps = np.array([max(float(r["p_any"]), float(r["p_ischemic"])) for r in rs])
+        a = roc_auc(y, ps); l_, h_ = bootstrap_auc_ci(y, ps)
+        aucs.append(a); lo.append(l_); hi.append(h_); names.append(name)
+
+    # 1. AUC barplot
+    colors = ["#c0392b", "#2980b9", "#7f8c8d"]
+    fig, ax = plt.subplots(figsize=(7,5))
+    err = [[a-l for a,l in zip(aucs,lo)], [h-a for a,h in zip(aucs,hi)]]
+    bars = ax.bar(names, aucs, color=colors, edgecolor="black", yerr=err, capsize=6)
+    ax.axhline(0.5, color="gray", linestyle="--", lw=1, label="Chance (AUC = 0.5)")
+    ax.set_ylim(0, 1.0); ax.set_ylabel("AUC (slice-level)")
+    ax.set_title(f"Kaggle Brain Stroke CT — Slice-level AUC\n(ct-brain-pipeline, n={len(rows)} DICOM slices)")
+    for bar, a in zip(bars, aucs):
+        ax.text(bar.get_x()+bar.get_width()/2, a+0.03, f"{a:.3f}",
+                ha="center", va="bottom", fontsize=11, fontweight="bold")
+    ax.legend(loc="upper right", frameon=False)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    plt.tight_layout(); plt.savefig(out_dir / "kaggle_auc_barplot.png", dpi=200); plt.close()
+
+    # 2. ROC curves
+    def roc_curve(y, s):
+        y = np.asarray(y); s = np.asarray(s)
+        order = np.argsort(-s); y = y[order]
+        tps = np.cumsum(y == 1); fps = np.cumsum(y == 0)
+        P = (y == 1).sum(); N = (y == 0).sum()
+        return np.concatenate([[0], fps/N]), np.concatenate([[0], tps/P])
+
+    fig, ax = plt.subplots(figsize=(7,6))
+    pairs = [
+        ("Hemorrhage (Bleeding vs Normal)", ("Bleeding","Normal"), "gt_hemorrhage", "p_any", "#c0392b"),
+        ("Ischemia (Ischemia vs Normal)",   ("Ischemia","Normal"), "gt_ischemic",   "p_ischemic", "#2980b9"),
+    ]
+    for nm, cls, gtk, pk, col in pairs:
+        rs = [r for r in rows if r["class"] in cls]
+        y = np.array([int(r[gtk]) for r in rs]); ps = np.array([float(r[pk]) for r in rs])
+        fpr, tpr = roc_curve(y, ps)
+        ax.plot(fpr, tpr, color=col, lw=2, label=f"{nm}  (AUC = {roc_auc(y,ps):.3f})")
+    rs = [r for r in rows if r["class"] in ("Bleeding","Ischemia","Normal")]
+    y = np.array([1 if r["class"] in ("Bleeding","Ischemia") else 0 for r in rs])
+    ps = np.array([max(float(r["p_any"]), float(r["p_ischemic"])) for r in rs])
+    fpr, tpr = roc_curve(y, ps)
+    ax.plot(fpr, tpr, color="#7f8c8d", lw=2, label=f"Any stroke vs Normal  (AUC = {roc_auc(y,ps):.3f})")
+    ax.plot([0,1],[0,1],"--",color="gray",lw=1,label="Chance")
+    ax.set_xlim(0,1); ax.set_ylim(0,1.02)
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+    ax.set_title("Kaggle Brain Stroke CT — ROC Curves\n(ct-brain-pipeline, slice-level)")
+    ax.legend(loc="lower right", frameon=False, fontsize=9)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    plt.tight_layout(); plt.savefig(out_dir / "kaggle_roc_curves.png", dpi=200); plt.close()
+
+    # 3. Score distributions
+    fig, axes = plt.subplots(1, 2, figsize=(13,5), sharey=True)
+    bins = np.linspace(0, 1, 41)
+    for cls, col, alpha in [("Normal","#27ae60",0.6),("Ischemia","#2980b9",0.6),("Bleeding","#c0392b",0.6)]:
+        vals = [float(r["p_any"]) for r in rows if r["class"] == cls]
+        axes[0].hist(vals, bins=bins, color=col, alpha=alpha,
+                     label=f"{cls} (n={len(vals)})", edgecolor="black", linewidth=0.3)
+    axes[0].set_xlabel("Hemorrhage probability  (p_any)")
+    axes[0].set_ylabel("Number of slices")
+    axes[0].set_title("Hemorrhage score distribution by class")
+    axes[0].legend(frameon=False)
+    axes[0].spines["top"].set_visible(False); axes[0].spines["right"].set_visible(False)
+    for cls, col, alpha in [("Normal","#27ae60",0.6),("Bleeding","#c0392b",0.6),("Ischemia","#2980b9",0.6)]:
+        vals = [float(r["p_ischemic"]) for r in rows if r["class"] == cls]
+        axes[1].hist(vals, bins=bins, color=col, alpha=alpha,
+                     label=f"{cls} (n={len(vals)})", edgecolor="black", linewidth=0.3)
+    axes[1].set_xlabel("Ischemic probability  (p_ischemic)")
+    axes[1].set_title("Ischemic score distribution by class")
+    axes[1].legend(frameon=False)
+    axes[1].spines["top"].set_visible(False); axes[1].spines["right"].set_visible(False)
+    plt.suptitle("Kaggle Brain Stroke CT — Score distributions  (ct-brain-pipeline)", y=1.02)
+    plt.tight_layout(); plt.savefig(out_dir / "kaggle_score_distributions.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    default_device = (
-        "cuda" if torch.cuda.is_available()
-        else ("mps" if torch.backends.mps.is_available() else "cpu")
-    )
-    parser.add_argument("--device", default=default_device,
-                        choices=["cpu", "cuda", "mps"], help="Inference device")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for inference")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    default_device = ("cuda" if torch.cuda.is_available()
+                      else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    parser.add_argument("--device", default=default_device, choices=["cpu","cuda","mps"])
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None,
-                        help="Limit images per class (smoke test)")
+                        help="Limit DICOMs per class (smoke test)")
     parser.add_argument("--classes", nargs="+", default=list(GT_CLASSES.keys()),
-                        choices=list(GT_CLASSES.keys()),
-                        help="Which class folders to evaluate")
+                        choices=list(GT_CLASSES.keys()))
     parser.add_argument("--dataset-path", default=None,
-                        help="Skip kagglehub download and use this local path")
-    parser.add_argument("--output-dir", default="output_kaggle",
-                        help="Where to write CSV / report")
+                        help="Local path; if omitted uses kagglehub cache")
+    parser.add_argument("--output-dir", default="output_kaggle_v2")
     args = parser.parse_args()
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Download dataset (or use provided path)
     if args.dataset_path:
         dl_path = Path(args.dataset_path)
-        print(f"Using local dataset path: {dl_path}")
     else:
         try:
             import kagglehub
         except ImportError:
-            print("ERROR: kagglehub not installed. Run: pip install kagglehub", file=sys.stderr)
-            return 1
-        print("Downloading dataset via kagglehub: ozguraslank/brain-stroke-ct-dataset …")
+            print("ERROR: pip install kagglehub", file=sys.stderr); return 1
         dl_path = Path(kagglehub.dataset_download("ozguraslank/brain-stroke-ct-dataset"))
-        print(f"  Dataset cached at: {dl_path}")
-
+    print(f"Dataset cached at: {dl_path}")
     root = find_dataset_root(dl_path)
     print(f"Dataset root: {root}")
 
-    # 2. Collect images
-    print("\nCollecting images:")
-    items = collect_images(root, args.classes, args.limit)
+    print("\nCollecting DICOMs:")
+    items = collect_dicoms(root, args.classes, args.limit)
     if not items:
-        print("ERROR: no images found", file=sys.stderr)
-        return 1
+        print("ERROR: no DICOMs found", file=sys.stderr); return 1
 
-    # 3. Load models
     device = torch.device(args.device)
     print(f"\nLoading models on {device} …")
     hem_models = load_hemorrhage_models(HEMORRHAGE_MODEL_DIR, device)
     isch_model = load_ischemic_model(ISCHEMIC_MODEL_PATH, device)
     if not hem_models:
-        print("ERROR: no hemorrhage model folds loaded", file=sys.stderr)
-        return 1
+        print("ERROR: no hemorrhage models", file=sys.stderr); return 1
 
-    # 4. Evaluate
     csv_path = out_dir / "predictions.csv"
-    stats = evaluate(items, hem_models, isch_model, device, args.batch_size, csv_path)
+    rows = evaluate(items, hem_models, isch_model, device, args.batch_size, csv_path)
 
-    # 5. Report
-    print_report(stats)
-    print("\n" + "=" * 72)
-    print("  AUC (slice-level discrimination)")
-    print("=" * 72)
-    print_auc_report(csv_path)
-    print(f"Per-image predictions: {csv_path}")
+    log_lines = []
+    print_report(rows, log_lines)
+    (out_dir / "results_summary.txt").write_text("\n".join(log_lines))
+
+    print("\nGenerating plots …")
+    make_plots(rows, out_dir)
+    print(f"  → {out_dir}/kaggle_auc_barplot.png")
+    print(f"  → {out_dir}/kaggle_roc_curves.png")
+    print(f"  → {out_dir}/kaggle_score_distributions.png")
+    print(f"\nPer-image predictions: {csv_path}")
     return 0
 
 
