@@ -236,14 +236,13 @@ def reslice_to_thickness(
         return slices, source_thickness, 1
 
     n = len(slices)
-    if n < group:
-        return slices, source_thickness, 1
-
-    resliced: list[np.ndarray] = []
-    for start in range(0, n - group + 1, group):
-        chunk = slices[start:start + group]
-        # Element-wise mean across slices in the group
-        avg = np.mean(np.stack(chunk, axis=0), axis=0).astype(np.float32)
+    Brain-window HU preprocessing for the ischemic model (prev/curr/next).
+    For single-slice input the current slice is replicated into all 3 channels.
+    Returns (256, 256, 3) uint8.
+    """
+    brain = apply_window(image_hu, center=40, width=80)
+    brain = cv2.resize(brain, (256, 256))
+    return np.stack([brain, brain, brain], axis=-1s=0), axis=0).astype(np.float32)
         resliced.append(avg)
 
     achieved = source_thickness * group
