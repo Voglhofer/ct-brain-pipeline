@@ -236,13 +236,14 @@ def reslice_to_thickness(
         return slices, source_thickness, 1
 
     n = len(slices)
-    Brain-window HU preprocessing for the ischemic model (prev/curr/next).
-    For single-slice input the current slice is replicated into all 3 channels.
-    Returns (256, 256, 3) uint8.
-    """
-    brain = apply_window(image_hu, center=40, width=80)
-    brain = cv2.resize(brain, (256, 256))
-    return np.stack([brain, brain, brain], axis=-1s=0), axis=0).astype(np.float32)
+    if n < group:
+        return slices, source_thickness, 1
+
+    resliced: list[np.ndarray] = []
+    for start in range(0, n - group + 1, group):
+        chunk = slices[start:start + group]
+        # Element-wise mean across slices in the group
+        avg = np.mean(np.stack(chunk, axis=0), axis=0).astype(np.float32)
         resliced.append(avg)
 
     achieved = source_thickness * group
@@ -296,14 +297,14 @@ def prepare_hemorrhage_input_series(images_hu: list[np.ndarray], idx: int) -> np
 
 def prepare_ischemic_input(image_hu: np.ndarray) -> np.ndarray:
     """
-    Multi-window HU preprocessing for the ischemic model.
-    Returns (256, 256, 3) uint8 with brain/stroke/soft-tissue channels.
+    Brain-window HU preprocessing for the 3-slice ischemic model
+    (prev/curr/next). For single-slice input the current slice is
+    replicated into all 3 channels.
+    Returns (256, 256, 3) uint8.
     """
-    ch_brain = apply_window(image_hu, center=40, width=80)
-    ch_stroke = apply_window(image_hu, center=32, width=8)
-    ch_soft = apply_window(image_hu, center=40, width=120)
-    img_3ch = np.stack([ch_brain, ch_stroke, ch_soft], axis=-1)
-    return cv2.resize(img_3ch, (256, 256))
+    brain = apply_window(image_hu, center=40, width=80)
+    brain = cv2.resize(brain, (256, 256))
+    return np.stack([brain, brain, brain], axis=-1)
 
 
 # ── Model definitions ─────────────────────────────────────────────────────
