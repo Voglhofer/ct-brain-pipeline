@@ -133,6 +133,21 @@ def train(model_name, image_size, smoke=False):
         train_transform, val_transform = generate_transforms(image_size)
         train_loader, val_loader = generate_dataset_loader(df_all, c_train, train_transform, train_batch_size, c_val, val_transform, val_batch_size, workers)
 
+        # Light validation set: fixed deterministic subset for per-epoch validation
+        # (full val runs only every 5 epochs because it's expensive).
+        # Gives 80 datapoints for the learning curve in the thesis instead of 16.
+        LIGHT_VAL_N = 50 if smoke else 5000
+        c_val_light = c_val[:LIGHT_VAL_N]
+        light_val_dataset = RSNA_Dataset_val_by_study_context(df_all, c_val_light, val_transform)
+        light_val_loader = torch.utils.data.DataLoader(
+            light_val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
         model = eval(model_name+'()')
         model = model.cuda()
 
@@ -153,6 +168,8 @@ def train(model_name, image_size, smoke=False):
             'fold': num_fold,
             'n_train_studies': len(c_train),
             'n_val_images': len(c_val),
+            'n_light_val_images': len(c_val_light),
+            'light_val_policy': 'first LIGHT_VAL_N images of val.txt, evaluated every epoch',
             'optimizer': 'Adam',
             'lr_initial': 0.0005,
             'weight_decay': 0.00002,
@@ -223,6 +240,20 @@ def train(model_name, image_size, smoke=False):
             outGT_np = None
             outPRED_np = None
 
+            # --- Light validation EVERY epoch (per-epoch learning curve) ---
+            # Uses fixed deterministic subset of val.txt, ~3% of full val set.
+            # Adds ~2-3 min per epoch on RTX 5090, total ~+3 hours across the run.
+            light_val_loss, light_auc, _, _, light_outGT_np, light_outPRED_np = epochVal(
+                model, light_val_loader, loss_cls, c_val_light, val_batch_size)
+
+            # --- Full validation every 5 epochs (best-model selection, unchanged) ---
+            valLoss = float('nan')
+            auc = [float('nan')] * 6
+            loss_list = [float('nan')] * 6
+            loss_sum = float('nan')
+            outGT_np = None
+            outPRED_np = None
+
             run_val = (epochID+1) % 5 == 0 or epochID > 79 or epochID == 0
             if smoke:
                 run_val = True
@@ -242,11 +273,27 @@ def train(model_name, image_size, smoke=False):
                 'LR': round(optimizer.state_dict()['param_groups'][0]['lr'], 8),
                 'EpochTime_s': round(epoch_time, 2),
                 'TrainLoss': round(trainLoss, 5),
+                # Light val: every epoch (deterministic subset)
+                'LightValLoss': round(light_val_loss, 5),
+                'LightValAUC_any': round(light_auc[0], 5),
+                'LightValAUC_epi': round(light_auc[1], 5),
+                'LightValAUC_ipa': round(light_auc[2], 5),
+                'LightValAUC_ive': round(light_auc[3], 5),
+                'LightValAUC_sah': round(light_auc[4], 5),
+                'LightValAUC_sdh': round(light_auc[5], 5),
+                # Full val: every 5 epochs (empty cells when not run)
                 'ValLoss': round(valLoss, 5) if np.isfinite(valLoss) else '',
                 'ValLegacyLossSum': loss_sum,
                 'ValLegacyLossPerClass': str(loss_list),
                 'ValLegacyAUC': str(auc),
             }
+
+            # Light val: compute the full per-class metric suite each epoch
+            light_full_metrics = compute_full_metrics(light_outGT_np, light_outPRED_np,
+                                                     class_names=HEMORRHAGE_CLASSES)
+            light_flat = flatten_for_csv(light_full_metrics, prefix='Light_')
+            for k, v in light_flat.items():
+                csv_row[k] = round(v, 6) if isinstance(v, float) else v
 
             # Gradient + system metrics
             grad_stats = grad_acc.summary()
@@ -279,9 +326,16 @@ def train(model_name, image_size, smoke=False):
                                 'val_AUC_any': any_auc},
                                os.path.join(snapshot_path, f'model_best_{num_fold}.pth'))
 
-            # Log via MetricLogger (handles CSV + JSON + npz)
+            # Log via MetricLogger (handles CSV + JSON + npz for full val)
             logger.log_epoch(epochID, csv_row, full_metrics=full_metrics,
                              gt=outGT_np, pred=outPRED_np)
+
+            # Always dump light val predictions for the learning-curve plots
+            np.savez_compressed(
+                os.path.join(fold_root, f'epoch_{epochID:03d}_lightval_predictions.npz'),
+                outGT=light_outGT_np.astype(np.float32),
+                outPRED=light_outPRED_np.astype(np.float32),
+            )
 
             # Legacy log preserves the exact original format
             legacy_result = [epochID,

@@ -73,15 +73,31 @@ The script runs sequentially:
 6. `SequenceModel/main.py` — 5 folds × 40 epochs (~5-8 hours)
 7. `analyze_training.py` — generates learning curves + LaTeX tables
 
+## Validation strategy (per epoch + every 5 epochs)
+
+- **Light validation** runs every epoch on a fixed 5000-slice subset of val.txt
+  → gives 80 datapoints for the learning curve in the thesis
+  → adds ~2-3 min per epoch on RTX 5090 (~3 extra hours total across the run)
+  → CSV columns prefixed `Light_*` and `LightVal*`
+  → predictions dumped to `epoch_<E>_lightval_predictions.npz`
+- **Full validation** runs every 5 epochs + epoch 0 + epoch 79 on the entire ~134k-slice val set
+  → used for best-model checkpoint selection (unchanged from SeuTao's design)
+  → CSV columns without prefix (`ValLoss`, `ValAUC_*`, etc.)
+  → predictions dumped to `epoch_<E>_val_predictions.npz`
+
+This addresses the advisor's request for a validation metric tracked
+throughout training while preserving SeuTao's checkpoint selection policy.
+
 ## Output locations (NOT in git)
 
 - CNN logs: `external/SeuTao_repo/2DNet/src/data_test/<backbone>_change_avg_256/fold<N>/`
-  - `log.csv` — flat metrics, one row per epoch
-  - `epoch_<E>_metrics.json` — full structured metrics
-  - `epoch_<E>_val_predictions.npz` — raw GT + predictions (for recomputing any metric post-hoc)
+  - `log.csv` — flat metrics, one row per epoch (~220 columns now, including Light_* prefixed metrics)
+  - `epoch_<E>_metrics.json` — full structured metrics (only on full-val epochs)
+  - `epoch_<E>_val_predictions.npz` — full val GT + predictions (only on full-val epochs)
+  - `epoch_<E>_lightval_predictions.npz` — light val GT + predictions (every epoch)
   - `train_metadata.json` — hyperparameters + dataset info
-  - `best_epoch.json` — best val AUC + epoch
-  - `model_best_<N>.pth` — checkpoint at best val AUC
+  - `best_epoch.json` — best val AUC + epoch (driven by full val)
+  - `model_best_<N>.pth` — checkpoint at best full-val AUC
 
 - SM logs: `external/SeuTao_repo/FinalSubmission/version3_debug/fold<N>/`
 - Plots + LaTeX: `training_analysis/`
