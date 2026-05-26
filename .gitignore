@@ -34,3 +34,16 @@ build/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# RSNA training (hospital workflow) — data/weights/outputs are downloaded
+# or generated on the hospital machine and must never enter git.
+rsna_training/data/
+rsna_training/downloads/
+rsna_training/external/SeuTao_repo/2DNet/src/data_test/
+rsna_training/external/SeuTao_repo/SequenceModel/csv/
+rsna_training/external/SeuTao_repo/SequenceModel/features/
+rsna_training/external/SeuTao_repo/SequenceModel/FinalSubmission/
+rsna_training/external/SeuTao_repo/2DNet/models/
+rsna_training/config.env
+rsna_training/training_analysis/
+rsna_training/*.log
