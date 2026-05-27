@@ -43,6 +43,55 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 echo "=== Step 1: Patch settings ==="
 python scripts/patch_settings.py
 
+# Step 1b: DICOM → PNG conversion. Skipped automatically if PNGs already exist.
+# Expects raw DICOMs at $RSNA_TRAIN_DIR / $RSNA_TEST_DIR (set in config.env).
+# Takes ~1-3 hours total on a workstation (uses all CPU cores).
+TRAIN_DCM_COUNT=$(ls -1 "${RSNA_TRAIN_DIR}" 2>/dev/null | wc -l || echo 0)
+TEST_DCM_COUNT=$(ls -1 "${RSNA_TEST_DIR}" 2>/dev/null | wc -l || echo 0)
+TRAIN_PNG_COUNT=$(ls -1 "${RSNA_TRAIN_PNG_DIR}" 2>/dev/null | wc -l || echo 0)
+TEST_PNG_COUNT=$(ls -1 "${RSNA_TEST_PNG_DIR}" 2>/dev/null | wc -l || echo 0)
+
+echo "=== Step 1b: DICOM→PNG conversion check ==="
+echo "  Raw DICOMs:  train=${TRAIN_DCM_COUNT}  test=${TEST_DCM_COUNT}"
+echo "  Existing PNG: train=${TRAIN_PNG_COUNT}  test=${TEST_PNG_COUNT}"
+
+if [ "${TRAIN_DCM_COUNT}" -eq 0 ] || [ "${TEST_DCM_COUNT}" -eq 0 ]; then
+  echo "FATAL: Raw DICOM folders empty or missing."
+  echo "  Expected DICOMs at:"
+  echo "    ${RSNA_TRAIN_DIR}"
+  echo "    ${RSNA_TEST_DIR}"
+  echo "  Run download_all.sh first, or fix paths in config.env."
+  exit 1
+fi
+
+# Convert if PNG count is far below DICOM count (allows resume if interrupted).
+if [ "${TRAIN_PNG_COUNT}" -lt "$((TRAIN_DCM_COUNT * 95 / 100))" ]; then
+  echo ">>> Converting train DICOMs → PNG (~1-2 hours)"
+  python3 "${SEUTAO_REPO_DIR}/2DNet/src/prepare_data.py" \
+    -dcm_path "${RSNA_TRAIN_DIR}" \
+    -png_path "${RSNA_TRAIN_PNG_DIR}" 2>&1 | tee "${PROJECT_ROOT}/prep_train.log"
+else
+  echo ">>> Train PNGs already present, skipping."
+fi
+
+if [ "${TEST_PNG_COUNT}" -lt "$((TEST_DCM_COUNT * 95 / 100))" ]; then
+  echo ">>> Converting test DICOMs → PNG (~15-30 min)"
+  python3 "${SEUTAO_REPO_DIR}/2DNet/src/prepare_data.py" \
+    -dcm_path "${RSNA_TEST_DIR}" \
+    -png_path "${RSNA_TEST_PNG_DIR}" 2>&1 | tee "${PROJECT_ROOT}/prep_test.log"
+else
+  echo ">>> Test PNGs already present, skipping."
+fi
+
+# Verify conversion actually produced files.
+FINAL_TRAIN_PNG=$(ls -1 "${RSNA_TRAIN_PNG_DIR}" 2>/dev/null | wc -l || echo 0)
+if [ "${FINAL_TRAIN_PNG}" -lt "$((TRAIN_DCM_COUNT * 95 / 100))" ]; then
+  echo "FATAL: DICOM→PNG conversion incomplete (${FINAL_TRAIN_PNG} / ${TRAIN_DCM_COUNT} train PNGs)."
+  echo "  Check ${PROJECT_ROOT}/prep_train.log for errors."
+  exit 1
+fi
+echo ">>> PNG conversion OK (${FINAL_TRAIN_PNG} train + $(ls -1 "${RSNA_TEST_PNG_DIR}" | wc -l) test PNGs)"
+
 echo "=== Step 2: Train DenseNet121 (5 folds × 80 epochs) ==="
 cd "${SEUTAO_REPO_DIR}/2DNet/src"
 python3 train.py \
