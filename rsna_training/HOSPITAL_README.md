@@ -75,6 +75,10 @@ The script runs sequentially:
 
 ## Validation strategy (per epoch + every 5 epochs)
 
+- **Training metrics** every epoch from accumulated batch predictions
+  → 0 extra time (uses predictions already produced during the forward pass)
+  → CSV columns prefixed `Train_*` (Train_AUC_any, Train_F1@0.5_any, etc.)
+  → Enables the classic train-vs-val overfitting curve
 - **Light validation** runs every epoch on a fixed 5000-slice subset of val.txt
   → gives 80 datapoints for the learning curve in the thesis
   → adds ~2-3 min per epoch on RTX 5090 (~3 extra hours total across the run)
@@ -87,6 +91,8 @@ The script runs sequentially:
 
 This addresses the advisor's request for a validation metric tracked
 throughout training while preserving SeuTao's checkpoint selection policy.
+The combination of `Train_AUC_any` + `Light_AUC_any` per epoch +
+`AUC_any` every 5 epochs gives a complete picture of learning dynamics.
 
 ## Output locations (NOT in git)
 

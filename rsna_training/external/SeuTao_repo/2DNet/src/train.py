@@ -204,6 +204,13 @@ def train(model_name, image_size, smoke=False):
             batch_times = []
             n_samples_seen = 0
             last_batch_end = time.time()
+            # Accumulate training predictions for per-epoch training AUC.
+            # The predictions are produced on the augmented data the model
+            # actually trains on, so they reflect the "in-training" decision
+            # surface. This is what's typically reported as "training AUC" in
+            # papers and is enough to expose overfitting against val AUC.
+            train_preds_acc = []
+            train_targets_acc = []
 
             for batchID, (input, target) in enumerate (train_loader):
                 if batchID == 0:
@@ -217,6 +224,11 @@ def train(model_name, image_size, smoke=False):
                 lossvalue = loss_cls(varOutput, varTarget)
                 trainLoss = trainLoss + lossvalue.item()
                 lossTrainNorm = lossTrainNorm + 1
+
+                # Store sigmoid(logits) for post-epoch metric computation
+                with torch.no_grad():
+                    train_preds_acc.append(varOutput.sigmoid().detach().cpu().numpy().astype(np.float32))
+                    train_targets_acc.append(target.detach().cpu().numpy().astype(np.float32))
 
                 lossvalue.backward()
                 # Record gradient L2-norm BEFORE optimizer.step()/zero_grad()
@@ -232,6 +244,14 @@ def train(model_name, image_size, smoke=False):
                 del lossvalue
 
             trainLoss = trainLoss / lossTrainNorm
+
+            # Compute training metrics from accumulated batch predictions
+            train_preds_np = np.concatenate(train_preds_acc, axis=0)
+            train_targets_np = np.concatenate(train_targets_acc, axis=0)
+            train_full_metrics = compute_full_metrics(
+                train_targets_np, train_preds_np, class_names=HEMORRHAGE_CLASSES)
+            # Free memory
+            del train_preds_acc, train_targets_acc
 
             valLoss = float('nan')
             auc = [float('nan')] * 6
@@ -293,6 +313,13 @@ def train(model_name, image_size, smoke=False):
                                                      class_names=HEMORRHAGE_CLASSES)
             light_flat = flatten_for_csv(light_full_metrics, prefix='Light_')
             for k, v in light_flat.items():
+                csv_row[k] = round(v, 6) if isinstance(v, float) else v
+
+            # Training metrics (computed on the predictions the model just
+            # produced during the epoch). Adds Train_* prefixed columns so
+            # the learning curve can show train AUC vs val AUC (overfitting).
+            train_flat = flatten_for_csv(train_full_metrics, prefix='Train_')
+            for k, v in train_flat.items():
                 csv_row[k] = round(v, 6) if isinstance(v, float) else v
 
             # Gradient + system metrics
