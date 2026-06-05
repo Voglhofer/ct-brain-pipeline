@@ -60,10 +60,17 @@ HEMORRHAGE_MODEL_DIR = BASE_DIR / "models" / "hemorrhage"
 ISCHEMIC_MODEL_PATH = BASE_DIR / "models" / "ischemic" / "best_model.pth"
 OUTPUT_DIR = BASE_DIR / "output"
 
-# Hemorrhage model labels & Youden-optimal thresholds
 HEMORRHAGE_LABELS = ["any", "epidural", "intraparenchymal",
                      "intraventricular", "subarachnoid", "subdural"]
-HEMORRHAGE_THRESHOLDS = {
+
+# Per-class Youden thresholds. Derived from concatenated out-of-fold RSNA
+# validation predictions (DenseNet121, 5 folds, best epoch per fold). See
+# scripts/derive_rsna_thresholds.py and config/thresholds_rsna_val.json.
+# Falls back to the legacy CT-ICH-tuned thresholds if the config file is
+# missing (preserves behaviour for environments that haven't pulled the
+# new config yet).
+HEMORRHAGE_THRESHOLDS_FILE = BASE_DIR / "config" / "thresholds_rsna_val.json"
+_LEGACY_HEMORRHAGE_THRESHOLDS = {
     "any": 0.3715,
     "epidural": 0.0247,
     "intraparenchymal": 0.1738,
@@ -71,6 +78,16 @@ HEMORRHAGE_THRESHOLDS = {
     "subarachnoid": 0.1967,
     "subdural": 0.2191,
 }
+
+
+def _load_hemorrhage_thresholds():
+    if HEMORRHAGE_THRESHOLDS_FILE.exists():
+        with open(HEMORRHAGE_THRESHOLDS_FILE) as f:
+            return json.load(f)["youden_thresholds"]
+    return dict(_LEGACY_HEMORRHAGE_THRESHOLDS)
+
+
+HEMORRHAGE_THRESHOLDS = _load_hemorrhage_thresholds()
 
 # ── DICOM → HU conversion ─────────────────────────────────────────────────
 
