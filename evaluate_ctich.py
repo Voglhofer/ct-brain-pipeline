@@ -62,7 +62,7 @@ from pipeline import (
     load_ischemic_model,
     predict_hemorrhage_batch,
     predict_ischemic_batch,
-    prepare_ischemic_input,
+    prepare_ischemic_input_series,
 )
 
 # Brain-window parameters of the dataset (standard 40/80 brain window).
@@ -206,7 +206,14 @@ def run_one_patient(
     hem_inputs = [make_3ch_neighbours(slices_uint8, i) for i in range(len(slices_uint8))]
     hem_results = predict_hemorrhage_batch(hem_models, hem_inputs, device, batch_size)
 
-    isch_inputs = [prepare_ischemic_input(uint8_to_pseudo_hu(s)) for s in slices_uint8]
+    # Ischemic: convert the whole series to pseudo-HU first, then build
+    # [prev, curr, next] 3-channel inputs to match training (boundary
+    # slices clamp prev/next to curr — same as stack_prev_curr_next).
+    slices_pseudo_hu = [uint8_to_pseudo_hu(s) for s in slices_uint8]
+    isch_inputs = [
+        prepare_ischemic_input_series(slices_pseudo_hu, i)
+        for i in range(len(slices_pseudo_hu))
+    ]
     isch_results = predict_ischemic_batch(isch_model, isch_inputs, device, batch_size)
 
     all_results = []
@@ -426,6 +433,164 @@ def print_report(rows: list[dict]) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+# ── Plots ──────────────────────────────────────────────────────────────────
+
+SUBTYPE_PLOT_ORDER = [
+    "any", "epidural", "intraparenchymal",
+    "intraventricular", "subarachnoid", "subdural",
+]
+SUBTYPE_COLORS = {
+    "any":              "#c0392b",
+    "epidural":         "#e67e22",
+    "intraparenchymal": "#f1c40f",
+    "intraventricular": "#27ae60",
+    "subarachnoid":     "#2980b9",
+    "subdural":         "#8e44ad",
+}
+
+
+def _roc_xy(y: np.ndarray, s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """ROC curve coordinates (FPR, TPR) by score-sorted cumulative counts."""
+    y = np.asarray(y); s = np.asarray(s)
+    order = np.argsort(-s); y = y[order]
+    tps = np.cumsum(y == 1); fps = np.cumsum(y == 0)
+    P = (y == 1).sum(); N = (y == 0).sum()
+    return (np.concatenate([[0], fps / max(N, 1)]),
+            np.concatenate([[0], tps / max(P, 1)]))
+
+
+def make_plots(rows: list[dict], out_dir: Path) -> None:
+    """Generate ctich_auc_barplot.png, ctich_roc_curves.png,
+    ctich_score_distributions.png in the same visual style as
+    evaluate_kaggle.py's make_plots().
+
+    All metrics are patient-level. Subtype-level AUC uses the patient-level
+    max-probability for that subtype against the patient-level subtype GT.
+    Ischemic distributions are shown but unscored (no ischemic GT).
+    """
+    import matplotlib.pyplot as plt
+
+    eval_rows = [r for r in rows if r["in_gt_csv"]]
+    if not eval_rows:
+        print("  No patients with ground truth — skipping plots.")
+        return
+
+    # Per-class y/score arrays
+    yp: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for cls in SUBTYPE_PLOT_ORDER:
+        y = np.array([int(r.get(f"gt_{cls}") or 0) for r in eval_rows])
+        s = np.array([float(r.get(f"p_{cls}") or 0.0) for r in eval_rows])
+        yp[cls] = (y, s)
+
+    # 1. AUC barplot per hemorrhage class + bootstrap 95% CI
+    aucs, los, his = [], [], []
+    for cls in SUBTYPE_PLOT_ORDER:
+        y, s = yp[cls]
+        aucs.append(roc_auc(y, s))
+        lo, hi = bootstrap_auc_ci(y, s)
+        los.append(lo); his.append(hi)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    err = [[a - l for a, l in zip(aucs, los)],
+           [h - a for a, h in zip(aucs, his)]]
+    bars = ax.bar(
+        SUBTYPE_PLOT_ORDER, aucs,
+        color=[SUBTYPE_COLORS[c] for c in SUBTYPE_PLOT_ORDER],
+        edgecolor="black", yerr=err, capsize=6,
+    )
+    ax.axhline(0.5, color="gray", linestyle="--", lw=1,
+               label="Chance (AUC = 0.5)")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("AUC (patient-level)")
+    ax.set_title(
+        "CT-ICH — Patient-level AUC per hemorrhage class\n"
+        f"(ct-brain-pipeline, n={len(eval_rows)} patients with GT)"
+    )
+    for bar, a in zip(bars, aucs):
+        ax.text(bar.get_x() + bar.get_width() / 2, a + 0.02,
+                f"{a:.3f}", ha="center", va="bottom",
+                fontsize=10, fontweight="bold")
+    ax.legend(loc="lower right", frameon=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(out_dir / "ctich_auc_barplot.png", dpi=200)
+    plt.close()
+
+    # 2. ROC curves — one per class on the same axes
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for cls in SUBTYPE_PLOT_ORDER:
+        y, s = yp[cls]
+        if (y == 1).sum() == 0 or (y == 0).sum() == 0:
+            continue
+        fpr, tpr = _roc_xy(y, s)
+        ax.plot(fpr, tpr, color=SUBTYPE_COLORS[cls], lw=2,
+                label=f"{cls}  (AUC = {roc_auc(y, s):.3f})")
+    ax.plot([0, 1], [0, 1], "--", color="gray", lw=1, label="Chance")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("CT-ICH — Patient-level ROC curves\n(ct-brain-pipeline)")
+    ax.legend(loc="lower right", frameon=False, fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(out_dir / "ctich_roc_curves.png", dpi=200)
+    plt.close()
+
+    # 3. Score distributions
+    #    Left: hemorrhage p_any colored by gt_any (CT-ICH has hemorrhage GT)
+    #    Right: ischemic p_ischemic colored by gt_any (sanity check —
+    #           ischemic head should not fire on hemorrhage-positive patients)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    bins = np.linspace(0, 1, 41)
+
+    y_any = np.array([int(r["gt_any"]) for r in eval_rows])
+    p_any = np.array([float(r["p_any"]) for r in eval_rows])
+    p_isch = np.array([float(r["p_ischemic"]) for r in eval_rows])
+
+    axes[0].hist(p_any[y_any == 0], bins=bins, color="#27ae60", alpha=0.6,
+                 label=f"GT negative (n={(y_any == 0).sum()})",
+                 edgecolor="black", linewidth=0.3)
+    axes[0].hist(p_any[y_any == 1], bins=bins, color="#c0392b", alpha=0.6,
+                 label=f"GT positive (n={(y_any == 1).sum()})",
+                 edgecolor="black", linewidth=0.3)
+    axes[0].set_xlabel("Hemorrhage probability  (p_any, patient-level max)")
+    axes[0].set_ylabel("Number of patients")
+    axes[0].set_title("Hemorrhage score distribution by GT")
+    axes[0].legend(frameon=False)
+    axes[0].spines["top"].set_visible(False)
+    axes[0].spines["right"].set_visible(False)
+
+    axes[1].hist(p_isch[y_any == 0], bins=bins, color="#27ae60", alpha=0.6,
+                 label=f"GT hemorrhage neg (n={(y_any == 0).sum()})",
+                 edgecolor="black", linewidth=0.3)
+    axes[1].hist(p_isch[y_any == 1], bins=bins, color="#c0392b", alpha=0.6,
+                 label=f"GT hemorrhage pos (n={(y_any == 1).sum()})",
+                 edgecolor="black", linewidth=0.3)
+    axes[1].set_xlabel("Ischemic probability  (p_ischemic, patient-level max)")
+    axes[1].set_ylabel("Number of patients")
+    axes[1].set_title(
+        "Ischemic score distribution by hemorrhage GT\n"
+        "(CT-ICH has no ischemic GT — sanity check only)"
+    )
+    axes[1].legend(frameon=False)
+    axes[1].spines["top"].set_visible(False)
+    axes[1].spines["right"].set_visible(False)
+
+    plt.suptitle(
+        "CT-ICH — Score distributions  (ct-brain-pipeline, patient-level)",
+        y=1.02,
+    )
+    plt.tight_layout()
+    plt.savefig(out_dir / "ctich_score_distributions.png",
+                dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+
 def find_dataset_root(path: Path) -> Path:
     """Locate the directory that contains Patients_CT/ + hemorrhage_diagnosis.csv."""
     candidates = [path] + [p for p in path.rglob("*") if p.is_dir()]
@@ -492,6 +657,13 @@ def main() -> int:
     # 5. Report
     print_report(rows)
     print(f"Per-patient predictions: {csv_path}")
+
+    # 6. Plots (same visual style as evaluate_kaggle.py)
+    print("\nGenerating plots …")
+    make_plots(rows, out_dir)
+    print(f"  → {out_dir}/ctich_auc_barplot.png")
+    print(f"  → {out_dir}/ctich_roc_curves.png")
+    print(f"  → {out_dir}/ctich_score_distributions.png")
     return 0
 
 

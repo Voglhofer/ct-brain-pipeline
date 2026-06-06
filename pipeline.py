@@ -324,6 +324,29 @@ def prepare_ischemic_input(image_hu: np.ndarray) -> np.ndarray:
     return np.stack([brain, brain, brain], axis=-1)
 
 
+def prepare_ischemic_input_series(images_hu: list[np.ndarray], idx: int) -> np.ndarray:
+    """
+    3-channel [prev, curr, next] ischemic input with neighbor-slice context.
+    Matches stack_prev_curr_next() from train_ischemic_robust.py: boundary
+    slices clamp to the current slice. Brain window 40/80 @ 256x256.
+    Returns (256, 256, 3) uint8.
+    """
+    n = len(images_hu)
+    prev_hu = images_hu[idx - 1] if idx > 0 else images_hu[idx]
+    curr_hu = images_hu[idx]
+    next_hu = images_hu[idx + 1] if idx < n - 1 else images_hu[idx]
+
+    ch_prev = apply_window(prev_hu, center=40, width=80)
+    ch_curr = apply_window(curr_hu, center=40, width=80)
+    ch_next = apply_window(next_hu, center=40, width=80)
+
+    ch_prev = cv2.resize(ch_prev, (256, 256))
+    ch_curr = cv2.resize(ch_curr, (256, 256))
+    ch_next = cv2.resize(ch_next, (256, 256))
+
+    return np.stack([ch_prev, ch_curr, ch_next], axis=-1)
+
+
 # ── Model definitions ─────────────────────────────────────────────────────
 
 class DenseNet121_Hemorrhage(nn.Module):
@@ -615,9 +638,10 @@ def run_pipeline_single_slice(
     """
     if images_hu_series is not None and slice_idx is not None:
         hem_input = prepare_hemorrhage_input_series(images_hu_series, slice_idx)
+        isch_input = prepare_ischemic_input_series(images_hu_series, slice_idx)
     else:
         hem_input = prepare_hemorrhage_input(image_hu)
-    isch_input = prepare_ischemic_input(image_hu)
+        isch_input = prepare_ischemic_input(image_hu)
 
     results = {}
 
@@ -655,9 +679,10 @@ def run_pipeline_batched(
     for i in range(n):
         if use_series:
             hem_inputs.append(prepare_hemorrhage_input_series(images_hu, i))
+            isch_inputs.append(prepare_ischemic_input_series(images_hu, i))
         else:
             hem_inputs.append(prepare_hemorrhage_input(images_hu[i]))
-        isch_inputs.append(prepare_ischemic_input(images_hu[i]))
+            isch_inputs.append(prepare_ischemic_input(images_hu[i]))
 
     # Run batched inference in parallel threads
     with ThreadPoolExecutor(max_workers=2) as executor:
